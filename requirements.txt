@@ -1,0 +1,13 @@
+numpy>=1.23.0
+opencv-python>=4.8.0
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.40.0       # Depth Anything V2 via HuggingFace
+huggingface_hub>=0.22.0
+onnx>=1.14.0
+onnxruntime-gpu>=1.16.0
+# TensorRT: install via NVIDIA wheel (requires CUDA toolkit on Linux):
+#   pip install tensorrt --extra-index-url https://pypi.ngc.nvidia.com
+# Minimum: tensorrt>=9.0.0  (uses IExecutionContext v3 API)
+pyyaml>=6.0
+pytest>=7.4.0

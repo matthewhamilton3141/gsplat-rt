@@ -1,0 +1,108 @@
+"""Compile the Depth Anything V2 ONNX model into a TensorRT FP16 engine.
+
+Requirements: tensorrt>=9.0.0, CUDA toolkit, NVIDIA GPU.
+
+Usage:
+    python src/depth/compile_trt.py
+    python src/depth/compile_trt.py --onnx models/depth_v2_small.onnx \
+                                    --engine models/depth_engine.engine \
+                                    --workspace-gb 4
+
+Build time is typically 2-5 minutes the first time (TRT performs layer
+profiling). The resulting .engine file is GPU-architecture-specific and
+must be regenerated if you move to a different GPU family.
+"""
+
+import argparse
+import os
+import time
+
+_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
+DEFAULT_ONNX_PATH = os.path.join(_ROOT, "models", "depth_v2_small.onnx")
+DEFAULT_ENGINE_PATH = os.path.join(_ROOT, "models", "depth_engine.engine")
+
+# Fixed I/O shapes matching export_onnx.py
+INPUT_H = 518
+INPUT_W = 518
+FIXED_SHAPE = (1, 3, INPUT_H, INPUT_W)
+
+
+def build_engine(
+    onnx_path: str = DEFAULT_ONNX_PATH,
+    engine_path: str = DEFAULT_ENGINE_PATH,
+    workspace_gb: int = 4,
+) -> None:
+    try:
+        import tensorrt as trt
+    except ImportError:
+        raise SystemExit(
+            "TensorRT is not installed. "
+            "pip install tensorrt --extra-index-url https://pypi.ngc.nvidia.com"
+        )
+
+    os.makedirs(os.path.dirname(os.path.abspath(engine_path)), exist_ok=True)
+
+    if not os.path.exists(onnx_path):
+        raise FileNotFoundError(
+            f"ONNX model not found: {onnx_path}\n"
+            "Run: python src/depth/export_onnx.py"
+        )
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    trt.init_libnvinfer_plugins(logger, "")
+
+    print(f"[compile] TensorRT {trt.__version__}")
+    print(f"[compile] ONNX   : {onnx_path}")
+    print(f"[compile] Engine : {engine_path}")
+    print(f"[compile] Flags  : FP16, workspace={workspace_gb} GiB")
+
+    builder = trt.Builder(logger)
+    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(network_flags)
+    parser = trt.OnnxParser(network, logger)
+    config = builder.create_builder_config()
+
+    # Workspace: TRT allocates scratch memory here for layer intermediates
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
+
+    # FP16 lets TRT use Tensor Core paths for all GEMM/conv operations
+    if not builder.platform_has_fast_fp16:
+        print("[compile] WARNING: GPU does not report fast FP16; engine will be slower")
+    config.set_flag(trt.BuilderFlag.FP16)
+
+    with open(onnx_path, "rb") as f:
+        raw = f.read()
+    if not parser.parse(raw):
+        errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+        raise RuntimeError(f"ONNX parse failed:\n{errors}")
+
+    # Single fixed-shape optimization profile (no dynamic batching)
+    profile = builder.create_optimization_profile()
+    inp_name = network.get_input(0).name
+    profile.set_shape(inp_name, FIXED_SHAPE, FIXED_SHAPE, FIXED_SHAPE)
+    config.add_optimization_profile(profile)
+
+    print("[compile] Building engine (this may take several minutes) …")
+    t0 = time.time()
+    serialized = builder.build_serialized_network(network, config)
+    if serialized is None:
+        raise RuntimeError("build_serialized_network returned None — check GPU memory and logs")
+    elapsed = time.time() - t0
+
+    with open(engine_path, "wb") as f:
+        f.write(serialized)
+
+    size_mb = os.path.getsize(engine_path) / 1e6
+    print(f"[compile] Done in {elapsed:.1f}s — {engine_path}  ({size_mb:.1f} MB)")
+
+    # Cleanup: Python GC must release these before the logger is destroyed
+    del parser, network, config, builder
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Build TensorRT FP16 depth engine")
+    ap.add_argument("--onnx", default=DEFAULT_ONNX_PATH)
+    ap.add_argument("--engine", default=DEFAULT_ENGINE_PATH)
+    ap.add_argument("--workspace-gb", type=int, default=4)
+    args = ap.parse_args()
+    build_engine(args.onnx, args.engine, args.workspace_gb)

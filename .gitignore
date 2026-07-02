@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# TensorRT & ONNX model artifacts (large binaries, machine-specific)
+models/*.engine
+models/*.onnx
+models/*.plan
+
+# Scene output (generated at runtime)
+output/
+
+# CUDA build artifacts
+*.so
+*.dylib
+*.dll
+kernels/__pycache__/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
