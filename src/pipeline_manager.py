@@ -150,9 +150,17 @@ class PipelineManager:
             time.sleep(10)       # let it run; stop() called on __exit__
     """
 
-    def __init__(self, config: Optional[PipelineConfig] = None):
+    def __init__(self, config: Optional[PipelineConfig] = None, pose_provider=None):
         self._config = config or PipelineConfig()
         cfg = self._config
+
+        # Optional per-frame pose source (M6). A callable (frame_bgr, depth) ->
+        # (4,4) camera-to-world matrix, or None. When None, every frame is fused
+        # at identity (the original fixed-camera behaviour). A pose provider only
+        # produces a coherent world map when depth is metric and scale-consistent
+        # across frames (an RGB-D sensor / TUM), which is exactly what the
+        # OdometryPoseProvider in src/slam expects.
+        self._pose_provider = pose_provider
 
         self._stop_event = threading.Event()
         self._started = False
@@ -423,11 +431,20 @@ class PipelineManager:
 
             self.frames_processed += 1
 
+            # --- Pose estimation (M6; None → identity, fixed-camera fusion) ---
+            pose = None
+            if self._pose_provider is not None:
+                try:
+                    pose = self._pose_provider(frame, depth)
+                except Exception:
+                    logger.exception("Pose provider failed on frame %d — using identity",
+                                     self.frames_processed)
+
             # --- TSDF update (non-blocking push; drops oldest depth on queue overflow) ---
-            self._collision_extractor.push_depth(depth, self._camera_k)
+            self._collision_extractor.push_depth(depth, self._camera_k, pose)
 
             # --- Gaussian accumulation (fast back-projection, O(sample_pixels)) ---
-            self._backproject_gaussians(depth)
+            self._backproject_gaussians(depth, pose)
 
             # --- Periodic USD export ---
             now = time.monotonic()
@@ -455,12 +472,17 @@ class PipelineManager:
             self._thread_errors["coordinator"] = exc
             self._stop_event.set()
 
-    def _backproject_gaussians(self, depth: np.ndarray) -> None:
-        """Sub-sample depth and back-project valid pixels to world-space 3D points.
+    def _backproject_gaussians(self, depth: np.ndarray,
+                               pose: Optional[np.ndarray] = None) -> None:
+        """Sub-sample depth and back-project valid pixels to 3D points.
 
         Uses pre-allocated index arrays (_sample_v, _sample_u).  The only
         per-call allocations are the small boolean mask and the resulting
         positions array (typically < 4 KB for 1089 samples).
+
+        With `pose` (a 4x4 camera-to-world matrix) the points are transformed
+        into the world frame so successive frames accumulate into one coherent
+        cloud; without it they stay in the camera frame (fixed-camera default).
         """
         z = depth[self._sample_v, self._sample_u]       # (S,) float32, no copy
         valid = z > 0.1
@@ -471,7 +493,11 @@ class PipelineManager:
         x_v = (self._sample_u[valid] - self._cx) * z_v / self._fx
         y_v = (self._sample_v[valid] - self._cy) * z_v / self._fy
 
-        pts = np.stack([x_v, y_v, z_v], axis=-1)        # (M, 3)
+        pts = np.stack([x_v, y_v, z_v], axis=-1)        # (M, 3) camera frame
+        if pose is not None:
+            # camera → world; errstate mutes float32 BLAS subnormal warnings (macOS)
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                pts = pts @ pose[:3, :3].T.astype(np.float32) + pose[:3, 3].astype(np.float32)
         # extend is amortised O(1) and GIL-atomic for CPython's deque
         self._gaussian_positions.extend(pts.tolist())
 

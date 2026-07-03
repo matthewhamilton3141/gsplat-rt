@@ -159,6 +159,26 @@ class RGBDOdometry:
         return TrackResult(self._pose.copy(), len(matches), n_inliers, ok)
 
 
+class OdometryPoseProvider:
+    """Adapts RGBDOdometry to the PipelineManager pose-provider contract.
+
+    Callable as ``provider(frame_bgr, depth) -> (4,4) camera-to-world``. The RGB
+    frame is resized to the depth map's resolution so pixels and intrinsics
+    agree. Intended for metric, scale-consistent depth (RGB-D sensor / TUM);
+    on monocular relative depth the estimated scale drifts frame to frame.
+    """
+
+    def __init__(self, intrinsics: CameraIntrinsics, **kwargs):
+        self._odom = RGBDOdometry(intrinsics, **kwargs)
+        self._hw = (intrinsics.height, intrinsics.width)
+
+    def __call__(self, frame_bgr: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        if frame_bgr.shape[:2] != depth.shape[:2]:
+            frame_bgr = cv2.resize(frame_bgr, (depth.shape[1], depth.shape[0]),
+                                   interpolation=cv2.INTER_LINEAR)
+        return self._odom.track(frame_bgr, depth).pose
+
+
 # ---------------------------------------------------------------------------
 # Trajectory evaluation — Absolute Trajectory Error (TUM standard)
 # ---------------------------------------------------------------------------
