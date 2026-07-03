@@ -57,6 +57,15 @@ class VideoStream:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                # Releasing a capture while another thread is inside read() is
+                # undefined in OpenCV (native deadlock/crash). Leak the handle
+                # instead — the daemon thread and device die with the process.
+                logger.warning(
+                    "Capture thread still alive after 2.0s (blocked in read()?) — "
+                    "skipping cap.release() to avoid a concurrent read/release race"
+                )
+                return
         if self._cap is not None:
             self._cap.release()
         logger.info(
