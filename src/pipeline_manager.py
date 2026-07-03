@@ -72,6 +72,12 @@ class PipelineConfig:
     write_previews: bool = True
     """Write 2-D preview PNGs (occupancy map + splat render) on each export."""
 
+    loop_source: bool = False
+    """Rewind a file source when it ends instead of stopping (no-op for webcam)."""
+
+    realtime_source: bool = False
+    """Pace a file source to its frame rate instead of reading at disk speed."""
+
     max_gaussians_export: int = 5_000
     """Maximum Gaussian splat centres kept in the ring buffer."""
 
@@ -261,7 +267,11 @@ class PipelineManager:
 
         # ---- Video ingestion ----
         from ingestion.video_stream import VideoStream
-        self._video_stream = VideoStream(source=cfg.video_source)
+        self._video_stream = VideoStream(
+            source=cfg.video_source,
+            loop=cfg.loop_source,
+            realtime=cfg.realtime_source,
+        )
         self._video_stream.start()
 
         # ---- Depth estimator ----

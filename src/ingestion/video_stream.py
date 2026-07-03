@@ -1,6 +1,7 @@
 import cv2
 import queue
 import threading
+import time
 import logging
 from typing import Optional, Union
 
@@ -24,16 +25,28 @@ class VideoStream:
         width: int = TARGET_WIDTH,
         height: int = TARGET_HEIGHT,
         queue_size: int = QUEUE_MAXSIZE,
+        loop: bool = False,
+        realtime: bool = False,
+        fps: Optional[float] = None,
     ):
         self.source = source
         self.width = width
         self.height = height
+        # loop: rewind a finished file source instead of stopping (no-op for a
+        #   live webcam, which never ends).
+        # realtime: pace reads to the source frame rate instead of reading at
+        #   disk speed — so a file plays like a live camera. Without this a file
+        #   is consumed in ~1s regardless of its duration.
+        self.loop = loop
+        self.realtime = realtime
+        self._fps_override = fps
         self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._cap: Optional[cv2.VideoCapture] = None
         self.frames_captured = 0
         self.frames_dropped = 0
+        self.loops_completed = 0
 
     def start(self) -> 'VideoStream':
         self._cap = cv2.VideoCapture(self.source)
@@ -93,11 +106,24 @@ class VideoStream:
         self.stop()
 
     def _capture_loop(self):
+        period = self._frame_period()          # 0.0 when pacing is disabled
+        next_deadline = time.monotonic()
+
         while not self._stop_event.is_set():
             ret, frame = self._cap.read()
             if not ret:
-                logger.warning("Frame read failed; source may be exhausted.")
-                break
+                if self.loop and not isinstance(self.source, int):
+                    # Rewind the file and keep going. If the very next read also
+                    # fails the file is unreadable, not just finished — stop.
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self._cap.read()
+                    if not ret:
+                        logger.warning("Loop rewind failed; stopping capture.")
+                        break
+                    self.loops_completed += 1
+                else:
+                    logger.warning("Frame read failed; source may be exhausted.")
+                    break
 
             frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
             self.frames_captured += 1
@@ -110,3 +136,21 @@ class VideoStream:
                 except queue.Empty:
                     pass
             self._queue.put_nowait(frame)
+
+            # Real-time pacing: sleep so frames enter at the source frame rate.
+            if period > 0:
+                next_deadline += period
+                sleep_for = next_deadline - time.monotonic()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                else:
+                    next_deadline = time.monotonic()   # fell behind; don't bank debt
+
+    def _frame_period(self) -> float:
+        """Seconds per frame for real-time pacing, or 0.0 if pacing is off."""
+        if not self.realtime:
+            return 0.0
+        fps = self._fps_override or (self._cap.get(cv2.CAP_PROP_FPS) if self._cap else 0.0)
+        if not fps or fps <= 0 or fps > 240:      # missing/garbage metadata
+            fps = 30.0
+        return 1.0 / fps

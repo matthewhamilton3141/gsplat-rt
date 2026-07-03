@@ -47,6 +47,8 @@ def main() -> int:
     ap.add_argument("--ascii-map", action="store_true", help="draw the occupancy map in the terminal")
     ap.add_argument("--no-color", action="store_true", help="plain ASCII (no ANSI colors)")
     ap.add_argument("--refresh", type=float, default=0.5, help="dashboard refresh period (s)")
+    ap.add_argument("--loop", action="store_true", help="rewind a file source at its end (endless source)")
+    ap.add_argument("--realtime", action="store_true", help="play a file at its frame rate, not disk speed")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -59,6 +61,8 @@ def main() -> int:
         video_source=_parse_source(args.source),
         output_dir=args.output_dir,
         usd_update_interval_s=args.interval,
+        loop_source=args.loop,
+        realtime_source=args.realtime,
     )
 
     manager = PipelineManager(cfg)
@@ -109,9 +113,10 @@ def main() -> int:
             # Stop conditions: duration elapsed, or a file source ran dry
             if args.duration > 0 and elapsed >= args.duration:
                 break
-            if df == 0 and s["frames"] > 0 and elapsed > 2.0:
+            if not args.loop and df == 0 and s["frames"] > 0 and elapsed > 2.0:
                 # No new frames for a full refresh after processing started —
-                # a file source has almost certainly been exhausted.
+                # a file source has almost certainly been exhausted. (A looped
+                # source never exhausts, so this check is skipped for --loop.)
                 print("\nSource exhausted — stopping.")
                 break
     except KeyboardInterrupt:

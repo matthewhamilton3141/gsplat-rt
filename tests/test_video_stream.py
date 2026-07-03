@@ -91,5 +91,47 @@ def _run_benchmark(stream: VideoStream):
     assert fps >= MIN_FPS, f"FPS {fps:.1f} is below minimum {MIN_FPS}"
 
 
+def _make_short_video(path: str, n_frames: int, fps: float = 30.0):
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (320, 240))
+    rng = np.random.default_rng(1)
+    for _ in range(n_frames):
+        writer.write(rng.integers(0, 256, (240, 320, 3), dtype=np.uint8))
+    writer.release()
+
+
+def test_loop_reads_past_end_of_file():
+    """A looped file source must keep producing frames beyond its length."""
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        path = tmp.name
+    try:
+        _make_short_video(path, n_frames=10)
+        stream = VideoStream(source=path, loop=True)
+        stream.start()
+        time.sleep(0.3)
+        stream.stop()
+        # 10-frame clip, looped for 0.3s at disk speed → far more than 10 reads
+        assert stream.frames_captured > 10
+        assert stream.loops_completed >= 1
+    finally:
+        os.unlink(path)
+
+
+def test_realtime_paces_to_frame_rate():
+    """Real-time pacing must NOT consume a 30-frame/1s clip instantly."""
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        path = tmp.name
+    try:
+        _make_short_video(path, n_frames=30, fps=30.0)   # ~1 s of footage
+        stream = VideoStream(source=path, realtime=True)
+        stream.start()
+        time.sleep(0.3)                                   # ~0.3 s in
+        captured = stream.frames_captured
+        stream.stop()
+        # At 30 fps, ~0.3 s should yield well under the full 30 frames
+        assert 2 <= captured < 25, f"pacing off: {captured} frames in ~0.3s"
+    finally:
+        os.unlink(path)
+
+
 if __name__ == '__main__':
     test_video_stream_fps()
