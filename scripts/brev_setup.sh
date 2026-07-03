@@ -92,6 +92,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. TUM RGB-D sequence for M6 SLAM (real depth + ground-truth poses)
+# ---------------------------------------------------------------------------
+# Set FETCH_TUM=0 to skip (e.g. a depth-only benchmark run).
+if [ "${FETCH_TUM:-1}" = "1" ]; then
+    log "Fetching TUM ${TUM_SEQ:-freiburg1_desk} for SLAM work"
+    bash scripts/fetch_tum.sh "${TUM_SEQ:-freiburg1_desk}"
+else
+    log "FETCH_TUM=0 — skipping TUM dataset download"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Full test suite (GPU benchmarks included)
 # ---------------------------------------------------------------------------
 log "Running full test suite"

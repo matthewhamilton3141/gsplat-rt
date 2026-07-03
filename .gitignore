@@ -28,6 +28,10 @@ models/*.plan
 # Scene output (generated at runtime)
 output/
 
+# Datasets & downloaded clips (large; fetched on demand, not committed)
+data/
+clips/
+
 # CUDA build artifacts
 *.so
 *.dylib
