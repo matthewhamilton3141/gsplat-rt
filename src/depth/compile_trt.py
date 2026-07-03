@@ -57,7 +57,12 @@ def build_engine(
     print(f"[compile] Flags  : FP16, workspace={workspace_gb} GiB")
 
     builder = trt.Builder(logger)
-    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    # EXPLICIT_BATCH was removed in TensorRT 10 (explicit batch is the only mode,
+    # flags=0). On TRT 8/9 the flag is still required. Guard so this builds on
+    # whichever version the NGC index resolves to.
+    network_flags = 0
+    if hasattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH"):
+        network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     network = builder.create_network(network_flags)
     parser = trt.OnnxParser(network, logger)
     config = builder.create_builder_config()

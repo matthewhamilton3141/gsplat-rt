@@ -23,7 +23,11 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from mapping.collision_proxy import CameraIntrinsics, TSDFVolume
-from mapping.visualization import save_occupancy_png, save_splat_preview
+from mapping.visualization import (
+    occupancy_to_ascii,
+    save_occupancy_png,
+    save_splat_preview,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,40 @@ def test_save_splat_preview_all_behind_camera_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# occupancy_to_ascii
+# ---------------------------------------------------------------------------
+
+def test_ascii_map_downsamples_to_max_cols():
+    tsdf = _synthetic_tsdf(grid_dim=64)
+    grid = tsdf.occupancy_grid_2d()
+    art = occupancy_to_ascii(grid, max_cols=20, color=False)
+    lines = art.split("\n")
+    # Every row fits the requested width, and there are rows to show
+    assert lines and all(len(ln) <= 20 for ln in lines)
+
+
+def test_ascii_map_plain_charset():
+    tsdf = _synthetic_tsdf(grid_dim=32)
+    art = occupancy_to_ascii(tsdf.occupancy_grid_2d(), color=False)
+    assert "\033[" not in art                       # no ANSI escapes
+    assert set(art) <= {"#", ".", " ", "\n"}
+
+
+def test_ascii_map_color_has_ansi():
+    tsdf = _synthetic_tsdf(grid_dim=32)
+    art = occupancy_to_ascii(tsdf.occupancy_grid_2d(), color=True)
+    assert "\033[" in art                            # colored output
+
+
+def test_ascii_map_occupied_survives_downsample():
+    """A single occupied cell must not vanish when the grid is reduced."""
+    grid = np.full((64, 64), -1, dtype=np.int8)
+    grid[10, 10] = 1
+    art = occupancy_to_ascii(grid, max_cols=16, color=False)
+    assert "#" in art
+
+
+# ---------------------------------------------------------------------------
 # Pipeline integration
 # ---------------------------------------------------------------------------
 
@@ -147,6 +185,13 @@ def test_pipeline_writes_preview_pngs():
         manager = PipelineManager(cfg)
         manager.start()
         time.sleep(1.0)          # let a few export ticks fire
+
+        # Live dashboard snapshot must reflect a running pipeline
+        s = manager.stats()
+        assert s["frames"] > 0
+        assert s["depth_backend"] == "mock"          # no GPU in CI
+        assert set(s) >= {"frames", "exports", "gaussians", "depth_ms", "depth_backend"}
+
         manager.stop(flush_usd=True)
 
         assert os.path.exists(manager.occupancy_png_path), "occupancy PNG missing"

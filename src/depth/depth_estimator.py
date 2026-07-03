@@ -75,12 +75,17 @@ class DepthEstimator:
         # Private CUDA stream: inference doesn't block other GPU work
         self._stream = torch.cuda.Stream()
 
-        # Pre-allocate device tensors — reused every call (no malloc on hot path)
+        # Pre-allocate device tensors — reused every call (no malloc on hot path).
+        # Dtype MUST match the engine's I/O binding types. The FP16 builder flag
+        # only enables reduced precision for internal layers; the network's input
+        # and output bindings keep the ONNX-declared float32, so these buffers are
+        # float32. Binding fp16 buffers here would size them at half the bytes TRT
+        # reads/writes → out-of-bounds access.
         self._dev_input = torch.empty(
-            (1, 3, INPUT_H, INPUT_W), dtype=torch.float16, device="cuda"
+            (1, 3, INPUT_H, INPUT_W), dtype=torch.float32, device="cuda"
         )
         self._dev_output = torch.empty(
-            (1, 1, INPUT_H, INPUT_W), dtype=torch.float16, device="cuda"
+            (1, 1, INPUT_H, INPUT_W), dtype=torch.float32, device="cuda"
         )
 
         # Pinned host buffer for fast DMA H2D copy
@@ -121,8 +126,9 @@ class DepthEstimator:
     def execute(self) -> np.ndarray:
         """Run one TRT inference pass. Assumes preprocess_cpu() was called first."""
         with torch.cuda.stream(self._stream):
-            # H2D: pinned float32 → device float16 (Tensor Core expects fp16)
-            self._dev_input.copy_(self._host_input.cuda(non_blocking=True).half())
+            # H2D: pinned float32 → device float32, straight DMA into the bound
+            # buffer (no per-frame temporaries). TRT casts to fp16 internally.
+            self._dev_input.copy_(self._host_input, non_blocking=True)
 
             # TensorRT async inference on our private stream
             ok = self._context.execute_async_v3(stream_handle=self._stream.cuda_stream)
@@ -130,7 +136,7 @@ class DepthEstimator:
                 raise RuntimeError("TensorRT execute_async_v3 returned False")
 
             # D2H: bring result back on the same stream to preserve ordering
-            result_cpu = self._dev_output.float().squeeze().cpu()
+            result_cpu = self._dev_output.squeeze().cpu()
 
         self._stream.synchronize()
         return result_cpu.numpy()   # (518, 518) float32

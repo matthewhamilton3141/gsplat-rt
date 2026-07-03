@@ -89,7 +89,34 @@ python src/depth/compile_trt.py
 # → models/depth_engine.engine
 ```
 
-### Step 3 — run the pipeline
+### Step 3 — run the pipeline (and watch it)
+
+The quickest way to run a source and *see* the pipeline working — a live status line plus, with `--ascii-map`, the occupancy map redrawn in your terminal (handy over SSH on a headless GPU box, no file copying):
+
+```bash
+python scripts/run_live.py --source 0 --ascii-map        # webcam
+python scripts/run_live.py --source clip.mp4 --duration 20
+```
+
+```
+[  4.5s] depth=tensorrt  fps= 31.2  frames=142   depth= 12.8ms  splats=5000  exports=2
+█████████████████████████████
+··············█████···········     █ occupied
+·····················█········     · free
+··········(top-down occupancy)     (blank) unknown — X→right, depth↑
+```
+
+It stops on `--duration`, when a file source is exhausted, or on Ctrl-C. Each run writes into `output/`:
+
+```
+live_scene.usdz               — scene for Isaac Sim / Omniverse
+live_scene_occupancy.png      — top-down occupancy map (floor plan)
+live_scene_splat_preview.png  — depth-colored splat cloud preview
+```
+
+The PNGs are overwritten in place on every export, so they always reflect the latest scene. Set `write_previews=False` on `PipelineConfig` to skip them.
+
+Or drive it from Python directly:
 
 ```python
 from src.pipeline_manager import PipelineManager, PipelineConfig
@@ -103,14 +130,8 @@ config = PipelineConfig(
 
 with PipelineManager(config) as pipeline:
     input("Pipeline running — press Enter to stop\n")
-
-# Each run writes, into output/:
-#   live_scene.usdz               — scene for Isaac Sim / Omniverse
-#   live_scene_occupancy.png      — top-down occupancy map (floor plan)
-#   live_scene_splat_preview.png  — depth-colored splat cloud preview
+    print(pipeline.stats())      # {frames, exports, gaussians, depth_ms, depth_backend}
 ```
-
-The two PNGs are overwritten in place on every export, so they always reflect the latest scene. Set `write_previews=False` on `PipelineConfig` to skip them.
 
 ### Loading in Isaac Sim
 
@@ -139,6 +160,10 @@ gsplat-rt/
 │   │   ├── usd_bridge.py         # OpenUSD stage writer
 │   │   └── visualization.py      # occupancy map + splat preview PNGs (numpy + cv2)
 │   └── pipeline_manager.py       # central orchestrator
+├── scripts/
+│   ├── run_live.py               # run + watch live (dashboard + ASCII map)
+│   ├── bench_pipeline.py         # per-stage latency + FPS benchmark
+│   └── brev_setup.sh             # one-shot GPU box bootstrap (Brev/A10G)
 ├── kernels/                      # custom CUDA kernels (.cu)
 ├── models/                       # .onnx and .engine files (not committed)
 ├── tests/
@@ -169,7 +194,8 @@ pytest tests/ -v
 | `test_full_pipeline_usdz` | No | Valid .usdz, both layers present |
 | `test_occupancy_grid_*` | No | 3-state top-down grid, correct shape/dtype |
 | `test_save_splat_preview_*` | No | Depth-colored PNG; empty input → no file |
-| `test_pipeline_writes_preview_pngs` | No | Both preview PNGs emitted on a live run |
+| `test_ascii_map_*` | No | Terminal occupancy render; obstacles survive downsample |
+| `test_pipeline_writes_preview_pngs` | No | Preview PNGs + live `stats()` on a running pipeline |
 | `test_pipeline_smoke` | No | Clean start/stop, no thread errors |
 | `test_pipeline_frame_throughput` | No | Periodic USD export fires on schedule |
 | `test_pipeline_full_usdz_validation` | No | Full USD layer + physics API check |

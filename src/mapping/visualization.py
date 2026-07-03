@@ -133,3 +133,59 @@ def save_splat_preview(
         )
     cv2.imwrite(path, img)
     return path
+
+
+# ANSI color codes for terminal rendering.
+_ANSI_RESET = "\033[0m"
+_ANSI_OCCUPIED = "\033[91m█\033[0m"   # bright red block
+_ANSI_FREE = "\033[90m·\033[0m"       # dim gray dot
+_ANSI_UNKNOWN = " "
+
+
+def occupancy_to_ascii(
+    grid: np.ndarray,
+    max_cols: int = 60,
+    color: bool = True,
+) -> str:
+    """Render a top-down occupancy grid as an ANSI/ASCII string for the terminal.
+
+    Lets you watch the map form over SSH on a headless box without exporting or
+    copying a PNG. Down-samples the grid so it fits `max_cols` columns; a column
+    is occupied if it contains any occupied cell, free if any free cell, else
+    unknown (occupied wins, so obstacles never vanish under down-sampling).
+
+    Same orientation as ``save_occupancy_png``: X to the right, depth upward.
+
+    Parameters
+    ----------
+    grid : ndarray (X, Z) int   values {-1 unknown, 0 free, 1 occupied}
+    max_cols : int              target width in characters
+    color : bool                emit ANSI colors (set False for plain ASCII)
+    """
+    grid = np.asarray(grid)
+    disp = np.flipud(grid.T)   # (Z, X), depth up — matches the PNG
+
+    rows, cols = disp.shape
+    if cols > max_cols:
+        step = int(np.ceil(cols / max_cols))
+        # Block-reduce: a block is occupied if any occupied, else free if any
+        # free (max over {-1,0,1} gives exactly that precedence).
+        rr = int(np.ceil(rows / step))
+        cc = int(np.ceil(cols / step))
+        reduced = np.full((rr, cc), -1, dtype=np.int8)
+        for i in range(rr):
+            for j in range(cc):
+                block = disp[i * step:(i + 1) * step, j * step:(j + 1) * step]
+                if block.size:
+                    reduced[i, j] = block.max()
+        disp = reduced
+
+    if color:
+        occ, free, unk = _ANSI_OCCUPIED, _ANSI_FREE, _ANSI_UNKNOWN
+    else:
+        occ, free, unk = "#", ".", " "
+
+    lines = []
+    for row in disp:
+        lines.append("".join(occ if v == 1 else free if v == 0 else unk for v in row))
+    return "\n".join(lines)

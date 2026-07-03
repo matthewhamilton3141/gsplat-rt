@@ -1,0 +1,133 @@
+"""Run the pipeline live and watch it work — the interactive entrypoint.
+
+Unlike bench_pipeline.py (which measures and exits), this streams a live view so
+you can see the pipeline running on a GPU box over SSH:
+
+  - a status line: FPS, depth latency, splat count, USD exports, backend
+  - optionally (--ascii-map) the top-down occupancy map redrawn in the terminal,
+    so you watch the scene reconstruct without copying a PNG back
+
+Logging is configured to INFO here (the library leaves it unconfigured), so the
+pipeline's own "USD export …" / start-stop messages also appear.
+
+Usage:
+    # webcam
+    python scripts/run_live.py --source 0 --ascii-map
+    # a video file, 20 s, into a chosen output dir
+    python scripts/run_live.py --source clip.mp4 --duration 20 --output-dir output/run1
+
+Stops on --duration, when a file source is exhausted, or on Ctrl-C.
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from pipeline_manager import PipelineConfig, PipelineManager
+from mapping.visualization import occupancy_to_ascii
+
+_CLEAR = "\033[2J\033[H"   # clear screen + home cursor
+
+
+def _parse_source(s: str):
+    """Webcam index (int) if all-digits, else a file path / URL string."""
+    return int(s) if s.isdigit() else s
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Run gsplat-rt live with a terminal dashboard")
+    ap.add_argument("--source", default="0", help="webcam index or video path/URL")
+    ap.add_argument("--duration", type=float, default=30.0, help="seconds to run (0 = until Ctrl-C)")
+    ap.add_argument("--output-dir", default="output")
+    ap.add_argument("--interval", type=float, default=2.0, help="USD/preview export interval (s)")
+    ap.add_argument("--ascii-map", action="store_true", help="draw the occupancy map in the terminal")
+    ap.add_argument("--no-color", action="store_true", help="plain ASCII (no ANSI colors)")
+    ap.add_argument("--refresh", type=float, default=0.5, help="dashboard refresh period (s)")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    cfg = PipelineConfig(
+        video_source=_parse_source(args.source),
+        output_dir=args.output_dir,
+        usd_update_interval_s=args.interval,
+    )
+
+    manager = PipelineManager(cfg)
+    manager.start()
+    print(f"\nPipeline started — depth backend: {manager.depth_backend}")
+    print(f"Outputs → {os.path.abspath(args.output_dir)}")
+    print("Press Ctrl-C to stop.\n")
+
+    t_start = time.monotonic()
+    last_t, last_frames = t_start, 0
+    fps = 0.0
+    try:
+        while True:
+            time.sleep(args.refresh)
+            now = time.monotonic()
+            s = manager.stats()
+
+            # FPS from the frame delta over the refresh window
+            df = s["frames"] - last_frames
+            dt = now - last_t
+            if dt > 0 and df > 0:
+                fps = df / dt
+            last_t, last_frames = now, s["frames"]
+
+            elapsed = now - t_start
+            status = (
+                f"[{elapsed:6.1f}s] depth={s['depth_backend']:<9} "
+                f"fps={fps:5.1f}  frames={s['frames']:<6} "
+                f"depth={s['depth_ms']:5.1f}ms  splats={s['gaussians']:<6} "
+                f"exports={s['exports']}"
+            )
+
+            if args.ascii_map:
+                grid = manager.latest_occupancy()
+                sys.stdout.write(_CLEAR)
+                print(status + "\n")
+                if grid is not None:
+                    print(occupancy_to_ascii(grid, color=not args.no_color))
+                    print("\n\033[91m█\033[0m occupied   \033[90m·\033[0m free   "
+                          "(blank) unknown   — X→right, depth↑" if not args.no_color
+                          else "# occupied   . free   (blank) unknown")
+                else:
+                    print("(waiting for first occupancy grid — needs a surface in view)")
+            else:
+                sys.stdout.write("\r" + status)
+                sys.stdout.flush()
+
+            # Stop conditions: duration elapsed, or a file source ran dry
+            if args.duration > 0 and elapsed >= args.duration:
+                break
+            if df == 0 and s["frames"] > 0 and elapsed > 2.0:
+                # No new frames for a full refresh after processing started —
+                # a file source has almost certainly been exhausted.
+                print("\nSource exhausted — stopping.")
+                break
+    except KeyboardInterrupt:
+        print("\nInterrupted — stopping.")
+    finally:
+        manager.stop(flush_usd=True)
+
+    s = manager.stats()
+    print(f"\nDone. frames={s['frames']} exports={s['exports']} "
+          f"splats={s['gaussians']} depth~{s['depth_ms']:.1f}ms")
+    print("Wrote:")
+    for p in (manager.usdz_path, manager.occupancy_png_path, manager.preview_png_path):
+        mark = "✓" if p and os.path.exists(p) else "·"
+        print(f"  {mark} {p}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

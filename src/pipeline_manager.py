@@ -164,6 +164,12 @@ class PipelineManager:
         self.usd_exports: int = 0
         self._last_export_frame: int = 0
 
+        # Rolling depth-inference wall-clock times (ms) for the live dashboard.
+        # deque.append is GIL-atomic; readers see a slightly stale mean, which is
+        # fine for a status line. This is a coarse wall-clock figure, not the
+        # CUDA-event benchmark in tests/test_depth_inference.py.
+        self._depth_ms: deque = deque(maxlen=120)
+
         # Gaussian ring buffer — deque.extend is atomic in CPython
         self._gaussian_positions: deque = deque(maxlen=cfg.max_gaussians_export)
 
@@ -341,6 +347,39 @@ class PipelineManager:
         self.stop()
 
     # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    @property
+    def depth_backend(self) -> str:
+        """'tensorrt' if the real TRT engine is loaded, else 'mock'."""
+        if isinstance(self._depth_estimator, _MockDepthEstimator):
+            return "mock"
+        return "tensorrt" if self._depth_estimator is not None else "unset"
+
+    def stats(self) -> dict:
+        """Non-blocking snapshot of live metrics for a status display.
+
+        Safe to call from another thread — reads GIL-atomic counters and a
+        rolling latency window written only by the coordinator.
+        """
+        samples = list(self._depth_ms)   # copy; deque may mutate mid-read
+        depth_ms = sum(samples) / len(samples) if samples else 0.0
+        return {
+            "frames": self.frames_processed,
+            "exports": self.usd_exports,
+            "gaussians": len(self._gaussian_positions),
+            "depth_ms": depth_ms,
+            "depth_backend": self.depth_backend,
+        }
+
+    def latest_occupancy(self) -> Optional[np.ndarray]:
+        """Most recent top-down occupancy grid, or None. For live visualization."""
+        if self._collision_extractor is None:
+            return None
+        return self._collision_extractor.get_latest_occupancy()
+
+    # ------------------------------------------------------------------
     # Core pipeline loop
     # ------------------------------------------------------------------
 
@@ -365,7 +404,9 @@ class PipelineManager:
 
             # --- Depth estimation (TRT device buffers reused across calls) ---
             try:
+                _t0 = time.perf_counter()
                 depth = self._depth_estimator.infer(frame)
+                self._depth_ms.append((time.perf_counter() - _t0) * 1e3)
             except Exception:
                 logger.exception("Depth infer failed on frame %d", self.frames_processed)
                 continue
