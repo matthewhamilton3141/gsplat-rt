@@ -225,6 +225,44 @@ class TSDFVolume:
         verts_world = (verts * self.voxel_size + self.origin).astype(np.float32)
         return TriangleMesh(vertices=verts_world, faces=faces.astype(np.int32))
 
+    def occupancy_grid_2d(
+        self,
+        vertical_axis: int = 1,
+        surface_level: float = 0.0,
+    ) -> np.ndarray:
+        """Collapse the volume into a top-down 2-D occupancy map.
+
+        Projects the observed voxels along the vertical (`Y`) axis to produce a
+        floor-plan the robot planner can consume directly. Cells carry three
+        states:
+
+            -1  unknown  — no observed voxel in this column
+             0  free     — observed, but no surface voxel in this column
+             1  occupied — at least one observed voxel is on/behind the surface
+
+        Parameters
+        ----------
+        vertical_axis : int
+            Grid axis to collapse. Defaults to 1 (world +Y), the vertical axis
+            for the pipeline's camera convention, leaving an (X, Z) grid.
+        surface_level : float
+            TSDF threshold below which a voxel counts as solid. 0.0 = on or
+            behind the zero-crossing surface.
+
+        Returns
+        -------
+        ndarray (N, N) int8 indexed [X, Z] (with the default vertical_axis).
+        """
+        observed = self._weight > 0
+        occupied_vox = observed & (self._tsdf <= surface_level)
+        col_observed = observed.any(axis=vertical_axis)
+        col_occupied = occupied_vox.any(axis=vertical_axis)
+
+        grid = np.full(col_observed.shape, -1, dtype=np.int8)
+        grid[col_observed] = 0
+        grid[col_occupied] = 1
+        return grid
+
     def reset(self) -> None:
         self._tsdf[:] = 1.0
         self._weight[:] = 0.0
@@ -267,6 +305,7 @@ class CollisionProxyExtractor:
         self._stop = threading.Event()
         self._mesh_lock = threading.Lock()
         self._latest_mesh: Optional[TriangleMesh] = None
+        self._latest_occupancy: Optional[np.ndarray] = None
         self.mesh_ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.frames_integrated = 0
@@ -313,6 +352,15 @@ class CollisionProxyExtractor:
         with self._mesh_lock:
             return self._latest_mesh
 
+    def get_latest_occupancy(self) -> Optional[np.ndarray]:
+        """Return the most recent top-down occupancy grid, or None if none yet.
+
+        A fresh copy taken under the mesh lock is returned so the caller can
+        render it while the worker keeps integrating.
+        """
+        with self._mesh_lock:
+            return None if self._latest_occupancy is None else self._latest_occupancy.copy()
+
     def __enter__(self):
         return self.start()
 
@@ -336,9 +384,15 @@ class CollisionProxyExtractor:
             now = time.monotonic()
             if now >= next_extract:
                 mesh = self._tsdf.extract_mesh()
-                if mesh is not None and not mesh.is_empty:
-                    with self._mesh_lock:
+                # Occupancy is meaningful even before a zero-crossing exists
+                # (free space is information too), so refresh it every tick.
+                occupancy = self._tsdf.occupancy_grid_2d()
+                have_mesh = mesh is not None and not mesh.is_empty
+                with self._mesh_lock:
+                    if have_mesh:
                         self._latest_mesh = mesh
+                    self._latest_occupancy = occupancy
+                if have_mesh:
                     self.mesh_ready.set()
                     self.meshes_extracted += 1
                 next_extract = now + self._update_interval

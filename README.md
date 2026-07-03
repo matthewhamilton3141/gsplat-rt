@@ -2,6 +2,8 @@
 
 Real-time conversion of live video into 3D Gaussian Splats with a physics-ready collision mesh, exported as an OpenUSD stage for NVIDIA Isaac Sim and Omniverse.
 
+> **Status: work in progress.** The pipeline runs end-to-end today (ingestion → depth → TSDF → USD + 2-D previews) and the CPU-side stages are benchmarked. The TensorRT depth path is validated on Ampere GPUs but the GPU latency figures below are **targets**, not yet a published measured run; a Python-only mock depth estimator keeps everything runnable on any machine. The Gaussian optimizer and SLAM pose tracking (see [Roadmap](#roadmap)) are not built yet — accumulated splats are currently raw back-projected points at identity pose.
+
 ## What it does
 
 A single video stream (webcam or file) enters the pipeline. Four concurrent stages transform it into a live scene description that a reinforcement learning robot can see and physically interact with:
@@ -10,6 +12,7 @@ A single video stream (webcam or file) enters the pipeline. Four concurrent stag
 2. **Depth estimation** — each frame is run through a TensorRT FP16 engine built from Depth Anything V2 Small, targeting under 15 ms per frame on Ampere+ GPUs.
 3. **Geometry extraction** — depth maps are fused into a TSDF volume at 10 Hz; marching cubes extracts a coarse collision mesh in a background thread.
 4. **USD export** — a `.usdz` stage is written periodically containing a `ParticleField` Gaussian Splat layer for NuRec rendering and an invisible `UsdGeom.Mesh` collision proxy with `UsdPhysics.CollisionAPI` for PhysX.
+5. **2-D previews** — alongside each export, two glanceable PNGs are written so you can eyeball a run without a USD viewer: a top-down **occupancy map** (floor plan from the TSDF) and a depth-colored **splat preview** (the point cloud projected through the camera). These need only numpy + OpenCV, so they render even when `pxr` and CUDA are absent.
 
 ## Architecture
 
@@ -101,8 +104,13 @@ config = PipelineConfig(
 with PipelineManager(config) as pipeline:
     input("Pipeline running — press Enter to stop\n")
 
-# output/live_scene.usdz is ready to open in Isaac Sim
+# Each run writes, into output/:
+#   live_scene.usdz               — scene for Isaac Sim / Omniverse
+#   live_scene_occupancy.png      — top-down occupancy map (floor plan)
+#   live_scene_splat_preview.png  — depth-colored splat cloud preview
 ```
+
+The two PNGs are overwritten in place on every export, so they always reflect the latest scene. Set `write_previews=False` on `PipelineConfig` to skip them.
 
 ### Loading in Isaac Sim
 
@@ -127,8 +135,9 @@ gsplat-rt/
 │   │   ├── compile_trt.py        # ONNX → TensorRT FP16 engine
 │   │   └── depth_estimator.py    # TRT inference, pre-alloc buffers
 │   ├── mapping/
-│   │   ├── collision_proxy.py    # TSDF volume + async mesh extractor
-│   │   └── usd_bridge.py         # OpenUSD stage writer
+│   │   ├── collision_proxy.py    # TSDF volume + async mesh extractor + occupancy grid
+│   │   ├── usd_bridge.py         # OpenUSD stage writer
+│   │   └── visualization.py      # occupancy map + splat preview PNGs (numpy + cv2)
 │   └── pipeline_manager.py       # central orchestrator
 ├── kernels/                      # custom CUDA kernels (.cu)
 ├── models/                       # .onnx and .engine files (not committed)
@@ -136,6 +145,7 @@ gsplat-rt/
 │   ├── test_video_stream.py      # 1,000-frame FPS benchmark
 │   ├── test_depth_inference.py   # TRT latency benchmark (GPU required)
 │   ├── test_usd_bridge.py        # TSDF + USD round-trip
+│   ├── test_visualization.py     # occupancy grid + preview PNG validation
 │   └── test_pipeline_integration.py  # end-to-end .usdz validation
 ├── configs/
 ├── requirements.txt
@@ -157,9 +167,14 @@ pytest tests/ -v
 | `test_tsdf_integration_and_mesh` | No | 3.3 ms/frame, mesh in 10 ms |
 | `test_extractor_async_10hz` | No | First mesh within 500 ms |
 | `test_full_pipeline_usdz` | No | Valid .usdz, both layers present |
+| `test_occupancy_grid_*` | No | 3-state top-down grid, correct shape/dtype |
+| `test_save_splat_preview_*` | No | Depth-colored PNG; empty input → no file |
+| `test_pipeline_writes_preview_pngs` | No | Both preview PNGs emitted on a live run |
 | `test_pipeline_smoke` | No | Clean start/stop, no thread errors |
 | `test_pipeline_frame_throughput` | No | Periodic USD export fires on schedule |
 | `test_pipeline_full_usdz_validation` | No | Full USD layer + physics API check |
+
+The GPU-required rows above are the pass criteria the tests assert against on Ampere hardware; the specific latency numbers are the target thresholds, not a published measured run.
 
 ## Performance targets
 

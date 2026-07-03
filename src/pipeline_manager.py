@@ -69,6 +69,9 @@ class PipelineConfig:
     usd_update_frame_count: int = 100
     """Also trigger a USD export after this many frames, whichever comes first."""
 
+    write_previews: bool = True
+    """Write 2-D preview PNGs (occupancy map + splat render) on each export."""
+
     max_gaussians_export: int = 5_000
     """Maximum Gaussian splat centres kept in the ring buffer."""
 
@@ -170,6 +173,8 @@ class PipelineManager:
         # Final output paths (set during start() once output_dir is known)
         self.usd_path: str = ""
         self.usdz_path: str = ""
+        self.occupancy_png_path: str = ""
+        self.preview_png_path: str = ""
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -243,6 +248,8 @@ class PipelineManager:
         os.makedirs(cfg.output_dir, exist_ok=True)
         self.usd_path  = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.usda")
         self.usdz_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.usdz")
+        self.occupancy_png_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_occupancy.png")
+        self.preview_png_path   = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_splat_preview.png")
 
         logger.info("PipelineManager starting — output: %s", cfg.output_dir)
 
@@ -417,12 +424,49 @@ class PipelineManager:
         # extend is amortised O(1) and GIL-atomic for CPython's deque
         self._gaussian_positions.extend(pts.tolist())
 
+    def _write_previews(self) -> None:
+        """Write the 2-D occupancy map + splat preview PNGs.
+
+        Independent of USD (no `pxr` needed) and best-effort: any failure is
+        logged but never interrupts the export or the pipeline. Each PNG is
+        overwritten in place, so the files always show the latest scene.
+        """
+        if not self._config.write_previews:
+            return
+        try:
+            from mapping.visualization import save_occupancy_png, save_splat_preview
+        except ImportError:
+            return
+
+        try:
+            grid = self._collision_extractor.get_latest_occupancy()
+            if grid is not None:
+                save_occupancy_png(grid, self.occupancy_png_path)
+        except Exception:
+            logger.exception("Occupancy PNG write failed")
+
+        try:
+            positions = list(self._gaussian_positions)
+            if positions:
+                save_splat_preview(
+                    positions,
+                    self._fx, self._fy, self._cx, self._cy,
+                    self._config.depth_input_w, self._config.depth_input_h,
+                    self.preview_png_path,
+                )
+        except Exception:
+            logger.exception("Splat preview write failed")
+
     def _trigger_usd_export(self, final: bool = False) -> None:
         """Snapshot the current Gaussian buffer + latest collision mesh to .usdz.
 
         The .usdz is written to a temporary path then renamed atomically so
         readers (e.g. Isaac Sim) never observe a half-written archive.
         """
+        # 2-D previews first — they don't need pxr, so they're produced even
+        # when USD export is unavailable on this machine.
+        self._write_previews()
+
         if self._usd_bridge is None:
             return
 
