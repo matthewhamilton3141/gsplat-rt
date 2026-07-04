@@ -44,6 +44,11 @@ cd "$REPO_DIR"
 # 2. Python dependencies
 # ---------------------------------------------------------------------------
 log "Installing Python dependencies"
+# Some Brev VM images ship a venv Python without pip — bootstrap it if missing.
+if ! python3 -m pip --version >/dev/null 2>&1; then
+    log "pip not found in this Python — bootstrapping via ensurepip"
+    python3 -m ensurepip --upgrade
+fi
 python3 -m pip install --upgrade pip -q
 python3 -m pip install -r requirements.txt -q
 
