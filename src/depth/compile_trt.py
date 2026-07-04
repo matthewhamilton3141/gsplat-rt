@@ -70,8 +70,10 @@ def build_engine(
     # Workspace: TRT allocates scratch memory here for layer intermediates
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
 
-    # FP16 lets TRT use Tensor Core paths for all GEMM/conv operations
-    if not builder.platform_has_fast_fp16:
+    # FP16 lets TRT use Tensor Core paths for all GEMM/conv operations.
+    # platform_has_fast_fp16 was removed from IBuilder in TensorRT 10+; it was
+    # only an informational check, so guard it and rely on the FP16 flag itself.
+    if hasattr(builder, "platform_has_fast_fp16") and not builder.platform_has_fast_fp16:
         print("[compile] WARNING: GPU does not report fast FP16; engine will be slower")
     config.set_flag(trt.BuilderFlag.FP16)
 
