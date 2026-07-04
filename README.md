@@ -2,14 +2,14 @@
 
 Real-time conversion of live video into 3D Gaussian Splats with a physics-ready collision mesh, exported as an OpenUSD stage for NVIDIA Isaac Sim and Omniverse.
 
-> **Status: work in progress.** The pipeline runs end-to-end today (ingestion → depth → TSDF → USD + 2-D previews) and the CPU-side stages are benchmarked. The TensorRT depth path is validated on Ampere GPUs but the GPU latency figures below are **targets**, not yet a published measured run; a Python-only mock depth estimator keeps everything runnable on any machine. The Gaussian optimizer and SLAM pose tracking (see [Roadmap](#roadmap)) are not built yet — accumulated splats are currently raw back-projected points at identity pose.
+> **Status: work in progress.** The pipeline runs end-to-end and is now **benchmarked on real hardware — 34.7 FPS on an NVIDIA A10G** (28.9 ms/frame), clearing the 30 FPS real-time budget, with TensorRT depth inference at **14.3 ms/frame**. A Python-only mock depth estimator keeps everything runnable GPU-free. The **M6 SLAM front-end is built**: an RGB-D visual-odometry tracker (5.6 cm ATE on TUM fr1/desk) supplies per-frame camera poses to pose-aware TSDF + Gaussian fusion. Not yet built: the M5 Gaussian optimizer, true FP16 depth, and a CUDA TSDF kernel (the one stage still over its per-call budget). See [Measured performance](#measured-performance-nvidia-a10g) and [Roadmap](#roadmap).
 
 ## What it does
 
 A single video stream (webcam or file) enters the pipeline. Four concurrent stages transform it into a live scene description that a reinforcement learning robot can see and physically interact with:
 
 1. **Video ingestion** — frames captured into a bounded queue at 1,000+ FPS throughput, decoupled from all downstream processing.
-2. **Depth estimation** — each frame is run through a TensorRT FP16 engine built from Depth Anything V2 Small, targeting under 15 ms per frame on Ampere+ GPUs.
+2. **Depth estimation** — each frame is run through a TensorRT engine built from Depth Anything V2 Small — **14.3 ms/frame measured on an A10G** (FP16 where the TensorRT version supports the weakly-typed flag, TF32 Tensor Cores on TensorRT 10+).
 3. **Geometry extraction** — depth maps are fused into a TSDF volume at 10 Hz; marching cubes extracts a coarse collision mesh in a background thread.
 4. **USD export** — a `.usdz` stage is written periodically containing a `ParticleField` Gaussian Splat layer for NuRec rendering and an invisible `UsdGeom.Mesh` collision proxy with `UsdPhysics.CollisionAPI` for PhysX.
 5. **2-D previews** — alongside each export, two glanceable PNGs are written so you can eyeball a run without a USD viewer: a top-down **occupancy map** (floor plan from the TSDF) and a depth-colored **splat preview** (the point cloud projected through the camera). These need only numpy + OpenCV, so they render even when `pxr` and CUDA are absent.
@@ -80,9 +80,9 @@ python src/depth/export_onnx.py
 # → models/depth_v2_small.onnx  (~50 MB)
 ```
 
-### Step 2 — compile the TensorRT FP16 engine
+### Step 2 — compile the TensorRT engine
 
-Profiles and builds the engine for your specific GPU. Run once; takes 2–5 minutes.
+Profiles and builds the engine for your specific GPU (FP16 on TensorRT 8/9, TF32 on 10+ — see [note](#a-note-on-precision-fp16-vs-tf32)). Run once; takes 2–5 minutes.
 
 ```bash
 python src/depth/compile_trt.py
@@ -152,23 +152,32 @@ gsplat-rt/
 │   ├── ingestion/
 │   │   └── video_stream.py       # threaded OpenCV capture
 │   ├── depth/
-│   │   ├── export_onnx.py        # HuggingFace → ONNX export
-│   │   ├── compile_trt.py        # ONNX → TensorRT FP16 engine
+│   │   ├── export_onnx.py        # HuggingFace → ONNX export (legacy exporter)
+│   │   ├── compile_trt.py        # ONNX → TensorRT engine (FP16/TF32, TRT 8–11)
 │   │   └── depth_estimator.py    # TRT inference, pre-alloc buffers
+│   ├── slam/
+│   │   ├── tum_dataset.py        # TUM RGB-D loader (rgb+depth+ground-truth poses)
+│   │   └── rgbd_odometry.py      # ORB+PnP visual odometry + ATE eval + pose provider
 │   ├── mapping/
 │   │   ├── collision_proxy.py    # TSDF volume + async mesh extractor + occupancy grid
 │   │   ├── usd_bridge.py         # OpenUSD stage writer
 │   │   └── visualization.py      # occupancy map + splat preview PNGs (numpy + cv2)
-│   └── pipeline_manager.py       # central orchestrator
+│   └── pipeline_manager.py       # central orchestrator (optional pose provider)
 ├── scripts/
 │   ├── run_live.py               # run + watch live (dashboard + ASCII map)
 │   ├── bench_pipeline.py         # per-stage latency + FPS benchmark
+│   ├── reconstruct_tum.py        # identity-vs-ground-truth-pose fusion proof
+│   ├── eval_odometry.py          # visual-odometry ATE + trajectory render
+│   ├── fetch_tum.sh              # idempotent TUM sequence download
 │   └── brev_setup.sh             # one-shot GPU box bootstrap (Brev/A10G)
-├── kernels/                      # custom CUDA kernels (.cu)
+├── kernels/                      # custom CUDA kernels (.cu) — TSDF kernel planned
 ├── models/                       # .onnx and .engine files (not committed)
 ├── tests/
 │   ├── test_video_stream.py      # 1,000-frame FPS benchmark
 │   ├── test_depth_inference.py   # TRT latency benchmark (GPU required)
+│   ├── test_tum_dataset.py       # TUM loader association + metric depth + SE(3) poses
+│   ├── test_rgbd_odometry.py     # visual odometry + ATE on fr1/desk
+│   ├── test_pose_aware_pipeline.py   # camera→world fusion via pose provider
 │   ├── test_usd_bridge.py        # TSDF + USD round-trip
 │   ├── test_visualization.py     # occupancy grid + preview PNG validation
 │   └── test_pipeline_integration.py  # end-to-end .usdz validation
@@ -187,8 +196,11 @@ pytest tests/ -v
 |---|---|---|
 | `test_video_stream_fps` | No | **1,113 FPS** ingestion throughput |
 | `test_depth_output_shape` | Yes | (518, 518) float32, no NaN |
-| `test_depth_inference_latency` | Yes | Mean < 15 ms, P99 < 20 ms |
+| `test_depth_inference_latency` | Yes | **A10G: 14.29 ms mean, P99 15.01 ms** ✓ |
 | `test_depth_buffer_reuse` | Yes | Zero GPU memory growth |
+| `test_tum_dataset_*` | No (needs dataset) | Association, metric depth, valid SE(3) poses |
+| `test_odometry_tracks_fr1_desk` | No (needs dataset) | **5.6 cm ATE**, 63 FPS CPU, 100% PnP-tracked |
+| `test_backproject_camera_vs_world` | No | Pose provider transforms points camera→world |
 | `test_tsdf_integration_and_mesh` | No | 3.3 ms/frame, mesh in 10 ms |
 | `test_extractor_async_10hz` | No | First mesh within 500 ms |
 | `test_full_pipeline_usdz` | No | Valid .usdz, both layers present |
@@ -200,23 +212,32 @@ pytest tests/ -v
 | `test_pipeline_frame_throughput` | No | Periodic USD export fires on schedule |
 | `test_pipeline_full_usdz_validation` | No | Full USD layer + physics API check |
 
-The GPU-required rows above are the pass criteria the tests assert against on Ampere hardware; the specific latency numbers are the target thresholds, not a published measured run.
+The two SLAM rows need an extracted TUM sequence (`bash scripts/fetch_tum.sh`) and skip cleanly without it.
 
-## Performance targets
+## Measured performance (NVIDIA A10G)
 
-| Stage | Budget | Notes |
-|---|---|---|
-| Video ingestion | — | Throughput-bound; queue absorbs bursts |
-| Depth inference | < 15 ms | TRT FP16, Ampere Tensor Cores |
-| TSDF integration | < 5 ms/frame | 64³ grid, numpy vectorised |
-| Mesh extraction | < 10 ms | scikit-image marching cubes |
-| Full pipeline | < 33 ms | 30 FPS end-to-end budget |
-| PhysX collision | 120 Hz | convexDecomposition baked at load time |
+First end-to-end GPU run, `scripts/bench_pipeline.py`, TensorRT 11.1 (TF32), 116 frames:
+
+| Stage | Budget | Measured (mean / p99) | Verdict |
+|---|---|---|---|
+| Video ingestion | — | throughput-bound (queue absorbs bursts) | — |
+| Depth inference | < 15 ms | 14.3 ms mean *(isolated; 15.1 under load)* | ✓ at budget |
+| TSDF integration | < 5 ms/frame | 13.1 ms / 25.6 ms | ✗ **bottleneck → CUDA kernel** |
+| Mesh extraction | < 10 ms | 10.0 ms / 20.7 ms | ✓ |
+| **Full pipeline (live)** | **≥ 30 FPS** | **28.9 ms/frame → 34.7 FPS** | **✓ real-time** |
+
+The pipeline clears 30 FPS because stages are decoupled across threads — the numpy TSDF's 13 ms runs on the 10 Hz worker and never gates the frame path. Two clear next wins: **true FP16** depth (TF32→FP16 should reach ~8–10 ms) and a **custom CUDA TSDF kernel** to bring integration under budget. PhysX collision runs at 120 Hz via `convexDecomposition` baked at load time.
+
+### A note on precision (FP16 vs TF32)
+
+The project targets an FP16 depth engine. TensorRT 10+/11 removed the weakly-typed `BuilderFlag.FP16`, moving precision control to strongly-typed networks, so `compile_trt.py` builds FP16 where the flag exists (TRT 8/9) and otherwise a default fp32 engine that still uses **Ampere Tensor Cores via TF32**. The 14.3 ms above is TF32; true FP16 on TRT 11 (an fp16 ONNX + a `STRONGLY_TYPED` network) is tracked in the roadmap.
 
 ## Roadmap
 
+- **CUDA TSDF kernel** — replace the numpy 64³ integrator (the one over-budget stage, 13 ms) with a custom kernel in `kernels/`, targeting sub-millisecond.
+- **True FP16 depth** — export an fp16 ONNX and build a `STRONGLY_TYPED` engine so TensorRT 11 runs genuine FP16 (~8–10 ms) rather than TF32.
+- **M6 — SLAM pose tracking** — *front-end done*: RGB-D visual odometry (`src/slam/`, ORB+PnP, 5.6 cm ATE on TUM fr1/desk) feeds per-frame poses into pose-aware fusion. Next: a learned front-end (SuperPoint + SuperGlue), keyframing / loop closure, and closing the monocular scale gap so poses work on the live mono-depth path, not just metric RGB-D.
 - **M5 — Gaussian optimizer** — differentiable 3DGS optimization on the accumulated point cloud (`src/gaussian/` is stubbed)
-- **M6 — SLAM pose tracking** — wire in SuperPoint + SuperGlue or ORB-SLAM3 so the TSDF integrates multi-view depth with correct camera poses
 - **M7 — Isaac Sim live reload** — hot-swap the `.usdz` stage in Omniverse as new geometry arrives, without restarting the simulation
 
 ## License
