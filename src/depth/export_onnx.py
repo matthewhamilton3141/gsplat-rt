@@ -77,6 +77,12 @@ def export(onnx_path: str = DEFAULT_ONNX_PATH) -> None:
             do_constant_folding=True,
             dynamic_axes=None,      # Fixed shape: max TRT optimization
             verbose=False,
+            # Force the legacy TorchScript exporter. torch 2.x defaults to the
+            # dynamo exporter, which on this model emits a weight-stripped graph
+            # (opset-18, external data) that compile_trt's in-memory parser.parse()
+            # cannot resolve. dynamo=False embeds weights in a single self-
+            # contained file (~50 MB) that TensorRT parses directly.
+            dynamo=False,
         )
 
     print(f"[export] Validating ONNX graph …")
