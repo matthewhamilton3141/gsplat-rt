@@ -132,8 +132,12 @@ def test_pipeline_frame_throughput():
             video_path = f.name
         try:
             _make_video(video_path, n_frames=300, fps=120.0)
-            # Trigger every 30 frames so it fires multiple times in a short run
-            cfg = _fast_config(video_path, tmpdir, usd_update_frame_count=30)
+            # Trigger every 30 frames so it fires multiple times in a short run.
+            # loop_source keeps frames flowing so the trigger is reached even when
+            # depth is a real (slower-than-mock) TRT engine that makes the bounded
+            # queue drop frames — otherwise the clip exhausts before 30 process.
+            cfg = _fast_config(video_path, tmpdir, usd_update_frame_count=30,
+                               loop_source=True)
 
             manager = PipelineManager(cfg)
             manager.start()

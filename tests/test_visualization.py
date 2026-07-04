@@ -189,7 +189,8 @@ def test_pipeline_writes_preview_pngs():
         # Live dashboard snapshot must reflect a running pipeline
         s = manager.stats()
         assert s["frames"] > 0
-        assert s["depth_backend"] == "mock"          # no GPU in CI
+        # "mock" on a CPU box, "tensorrt" when a real engine is present (GPU box).
+        assert s["depth_backend"] in ("mock", "tensorrt")
         assert set(s) >= {"frames", "exports", "gaussians", "depth_ms", "depth_backend"}
 
         manager.stop(flush_usd=True)
