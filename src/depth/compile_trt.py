@@ -54,7 +54,7 @@ def build_engine(
     print(f"[compile] TensorRT {trt.__version__}")
     print(f"[compile] ONNX   : {onnx_path}")
     print(f"[compile] Engine : {engine_path}")
-    print(f"[compile] Flags  : FP16, workspace={workspace_gb} GiB")
+    print(f"[compile] Workspace: {workspace_gb} GiB")
 
     builder = trt.Builder(logger)
     # EXPLICIT_BATCH was removed in TensorRT 10 (explicit batch is the only mode,
@@ -70,12 +70,23 @@ def build_engine(
     # Workspace: TRT allocates scratch memory here for layer intermediates
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
 
-    # FP16 lets TRT use Tensor Core paths for all GEMM/conv operations.
-    # platform_has_fast_fp16 was removed from IBuilder in TensorRT 10+; it was
-    # only an informational check, so guard it and rely on the FP16 flag itself.
-    if hasattr(builder, "platform_has_fast_fp16") and not builder.platform_has_fast_fp16:
-        print("[compile] WARNING: GPU does not report fast FP16; engine will be slower")
-    config.set_flag(trt.BuilderFlag.FP16)
+    # Precision, portable across TensorRT major versions.
+    #
+    # TRT 8/9 (weakly typed): set BuilderFlag.FP16 to let TRT run GEMM/conv on
+    #   Tensor Cores in half precision, keeping precision-sensitive layers in fp32.
+    # TRT 10/11: the weakly-typed FP16/INT8 flags were removed — precision now
+    #   comes from strongly-typed networks (the ONNX's own dtypes). With our fp32
+    #   ONNX the engine builds in fp32, which on Ampere still uses Tensor Cores via
+    #   TF32 (enabled by default). True FP16 there means an fp16 ONNX + a
+    #   STRONGLY_TYPED network — a follow-up if TF32 misses the latency budget.
+    if hasattr(trt.BuilderFlag, "FP16"):
+        if hasattr(builder, "platform_has_fast_fp16") and not builder.platform_has_fast_fp16:
+            print("[compile] WARNING: GPU does not report fast FP16; engine will be slower")
+        config.set_flag(trt.BuilderFlag.FP16)
+        print("[compile] Precision: FP16")
+    else:
+        print("[compile] Precision: default fp32 (TF32 Tensor Cores on Ampere) — "
+              "weakly-typed FP16 flag absent in TensorRT %s" % trt.__version__)
 
     with open(onnx_path, "rb") as f:
         raw = f.read()
