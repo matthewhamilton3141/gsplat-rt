@@ -100,11 +100,18 @@ void tsdf_integrate_cuda(
     TORCH_CHECK(tsdf.is_cuda() && weight.is_cuda() && depth.is_cuda(),
                 "tsdf, weight and depth must be CUDA tensors");
     TORCH_CHECK(tsdf.scalar_type() == torch::kFloat32, "tsdf must be float32");
+    // Updated in place, so they must be contiguous (no silent copy).
+    TORCH_CHECK(tsdf.is_contiguous() && weight.is_contiguous(),
+                "tsdf and weight must be contiguous");
 
     auto R = R_wc.contiguous().cpu();       // 9 scalars — pull to host once
     auto t = t_wc.contiguous().cpu();
     const float* r = R.data_ptr<float>();
     const float* tt = t.data_ptr<float>();
+
+    // Hold the contiguous depth in a named tensor: the kernel launch is async,
+    // so a temporary from depth.contiguous() could be freed before it runs.
+    auto depth_c = depth.contiguous();
 
     const int total = N * N * N;
     const int threads = 256;
@@ -113,7 +120,7 @@ void tsdf_integrate_cuda(
     tsdf_integrate_kernel<<<blocks, threads>>>(
         tsdf.data_ptr<float>(),
         weight.data_ptr<float>(),
-        depth.contiguous().data_ptr<float>(),
+        depth_c.data_ptr<float>(),
         N, (float)voxel_size,
         (float)ox, (float)oy, (float)oz,
         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
@@ -121,7 +128,7 @@ void tsdf_integrate_cuda(
         (float)fx, (float)fy, (float)cx, (float)cy,
         width, height, (float)trunc);
 
-    C10_CUDA_CHECK(cudaGetLastError());
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "tsdf_integrate kernel launch failed");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
