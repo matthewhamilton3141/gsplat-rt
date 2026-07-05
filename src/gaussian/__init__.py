@@ -10,9 +10,11 @@ Public API:
 from .gaussian_model import GaussianModel, quat_to_rotmat, sigmoid
 from .rasterizer import Camera, rasterize, rasterize_backward
 from .optimizer import FitResult, LearningRates, fit, psnr
+from .finalize import finalize_gaussians, pose_to_camera, write_ply, sh_dc_from_rgb
 
 __all__ = [
     "GaussianModel", "quat_to_rotmat", "sigmoid",
     "Camera", "rasterize", "rasterize_backward",
     "FitResult", "LearningRates", "fit", "psnr",
+    "finalize_gaussians", "pose_to_camera", "write_ply", "sh_dc_from_rgb",
 ]

@@ -97,6 +97,28 @@ class PipelineConfig:
     camera_fov_deg: float = 70.0
     """Symmetric horizontal FOV used for back-projection and TSDF intrinsics."""
 
+    # ---- Offline Gaussian finalize (M5) ----
+    optimize_on_finalize: bool = False
+    """Run the differentiable Gaussian optimiser once on stop(), fitting the
+    accumulated points to captured keyframes. This is an *offline* refinement,
+    not part of the 30 FPS hot path — CPU numpy is far too slow for per-frame
+    optimisation, so it runs once at shutdown."""
+
+    keyframe_interval: int = 15
+    """Capture an RGB keyframe (for the finalize optimiser) every N frames."""
+
+    max_keyframes: int = 6
+    """Ring-buffer size of keyframes retained for the finalize fit."""
+
+    finalize_res: int = 96
+    """Square resolution the keyframes are optimised at (CPU budget)."""
+
+    finalize_iters: int = 150
+    """Optimiser iterations in the finalize stage."""
+
+    finalize_max_points: int = 2000
+    """Cap on Gaussians seeded from the accumulated cloud during finalize."""
+
 
 # ---------------------------------------------------------------------------
 # Mock depth estimator (CUDA / TRT absent)
@@ -187,6 +209,13 @@ class PipelineManager:
         # Gaussian ring buffer — deque.extend is atomic in CPython
         self._gaussian_positions: deque = deque(maxlen=cfg.max_gaussians_export)
 
+        # Keyframe ring buffer for the offline finalize optimiser (M5): each is
+        # (rgb float32 [finalize_res, finalize_res, 3] in [0,1], pose or None).
+        self._keyframes: deque = deque(maxlen=cfg.max_keyframes)
+        # Set by run_finalize(); the optimized scene the final export prefers.
+        self.optimized_gaussians = None            # GaussianModel | None
+        self.finalize_result = None                # FitResult | None
+
         # Pre-allocated depth sampling grid and camera model (immutable after init)
         self._init_sampling_grid()
 
@@ -195,6 +224,7 @@ class PipelineManager:
         self.usdz_path: str = ""
         self.occupancy_png_path: str = ""
         self.preview_png_path: str = ""
+        self.ply_path: str = ""
 
     # ------------------------------------------------------------------
     # Initialisation helpers
@@ -270,6 +300,7 @@ class PipelineManager:
         self.usdz_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.usdz")
         self.occupancy_png_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_occupancy.png")
         self.preview_png_path   = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_splat_preview.png")
+        self.ply_path           = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.ply")
 
         logger.info("PipelineManager starting — output: %s", cfg.output_dir)
 
@@ -339,6 +370,14 @@ class PipelineManager:
             self._collision_extractor.stop()
         if self._video_stream:
             self._video_stream.stop()
+
+        # Offline Gaussian optimisation (M5), before the final snapshot so the
+        # exported scene carries optimized splats rather than raw defaults.
+        if self._config.optimize_on_finalize:
+            try:
+                self.run_finalize()
+            except Exception:
+                logger.exception("Gaussian finalize failed")
 
         # Final USD snapshot — coordinator is done, so USD bridge access is safe
         if flush_usd:
@@ -446,6 +485,10 @@ class PipelineManager:
             # --- Gaussian accumulation (fast back-projection, O(sample_pixels)) ---
             self._backproject_gaussians(depth, pose)
 
+            # --- Keyframe capture for the offline finalize optimiser (M5) ---
+            if self._config.optimize_on_finalize:
+                self._maybe_capture_keyframe(frame, pose)
+
             # --- Periodic USD export ---
             now = time.monotonic()
             frames_since = self.frames_processed - self._last_export_frame
@@ -501,6 +544,77 @@ class PipelineManager:
         # extend is amortised O(1) and GIL-atomic for CPython's deque
         self._gaussian_positions.extend(pts.tolist())
 
+    def _maybe_capture_keyframe(self, frame: np.ndarray,
+                                pose: Optional[np.ndarray]) -> None:
+        """Every keyframe_interval frames, stash a small RGB view + pose.
+
+        Cheap (one resize + colour swap every N frames), off the critical
+        latency, and bounded by the ring buffer. These are the target views the
+        offline finalize optimiser fits the Gaussians against.
+        """
+        if self.frames_processed % self._config.keyframe_interval != 0:
+            return
+        try:
+            import cv2
+            res = self._config.finalize_res
+            small = cv2.resize(frame, (res, res), interpolation=cv2.INTER_AREA)
+            rgb = small[:, :, ::-1].astype(np.float32) / 255.0   # BGR→RGB, [0,1]
+        except Exception:
+            logger.exception("Keyframe capture failed on frame %d", self.frames_processed)
+            return
+        pose_copy = None if pose is None else np.array(pose, dtype=np.float64)
+        self._keyframes.append((np.ascontiguousarray(rgb), pose_copy))
+
+    def run_finalize(self) -> bool:
+        """Offline: optimise the accumulated Gaussians against captured keyframes.
+
+        Runs once (typically from stop()). Populates self.optimized_gaussians /
+        self.finalize_result and writes a 3DGS .ply. Returns True on success.
+        Never part of the real-time loop — pure numpy is far too slow per frame.
+        """
+        keyframes = list(self._keyframes)
+        positions = list(self._gaussian_positions)
+        if not keyframes or not positions:
+            logger.warning("Finalize skipped — keyframes=%d points=%d",
+                           len(keyframes), len(positions))
+            return False
+
+        from gaussian.finalize import finalize_gaussians, pose_to_camera, write_ply
+        from gaussian.gaussian_model import GaussianModel
+        from gaussian.optimizer import psnr
+        from gaussian.rasterizer import rasterize
+
+        res = self._config.finalize_res
+        fov_rad = math.radians(self._config.camera_fov_deg)
+        fx = (res / 2.0) / math.tan(fov_rad / 2.0)
+        views = [
+            (pose_to_camera(pose, fx, fx, res, res), rgb)
+            for rgb, pose in keyframes
+        ]
+        points = np.asarray(positions, dtype=np.float64)
+
+        seed = GaussianModel.from_points(points[:self._config.finalize_max_points])
+        start = float(np.mean([psnr(rasterize(seed, cam)[0], tgt) for cam, tgt in views]))
+        logger.info("Finalize: %d points, %d keyframes, %d iters @ %dpx (start PSNR %.2f dB)",
+                    len(positions), len(views), self._config.finalize_iters, res, start)
+
+        model, result = finalize_gaussians(
+            points, views,
+            max_points=self._config.finalize_max_points,
+            iters=self._config.finalize_iters,
+        )
+        self.optimized_gaussians = model
+        self.finalize_result = result
+        logger.info("Finalize done: PSNR %.2f → %.2f dB, L1 %.4f → %.5f",
+                    start, result.psnrs[-1], result.losses[0], result.losses[-1])
+
+        try:
+            write_ply(model, self.ply_path)
+            logger.info("Wrote optimized splats → %s", self.ply_path)
+        except Exception:
+            logger.exception("PLY write failed")
+        return True
+
     def _write_previews(self) -> None:
         """Write the 2-D occupancy map + splat preview PNGs.
 
@@ -534,6 +648,37 @@ class PipelineManager:
         except Exception:
             logger.exception("Splat preview write failed")
 
+    def _splat_export_arrays(self):
+        """Assemble (means, scales, rotations, opacities, sh_coeffs) for USD.
+
+        Prefers the optimized Gaussians from run_finalize() when present (real
+        per-splat colour/opacity/shape); otherwise falls back to the raw
+        accumulated centres with default splat attributes. Returns None if the
+        scene is empty.
+        """
+        model = self.optimized_gaussians
+        if model is not None:
+            from gaussian.finalize import sh_dc_from_rgb
+            means     = model.means.astype(np.float32)
+            scales    = model.scales.astype(np.float32)        # linear stddev
+            rotations = (model.quats /
+                         (np.linalg.norm(model.quats, axis=1, keepdims=True) + 1e-12)
+                         ).astype(np.float32)
+            opacities = model.alphas.astype(np.float32)        # sigmoid-space
+            sh        = sh_dc_from_rgb(model.rgb)               # (N, 3) DC term
+            return means, scales, rotations, opacities, sh
+
+        positions = list(self._gaussian_positions)   # snapshot the deque
+        if not positions:
+            return None
+        n = len(positions)
+        means     = np.array(positions, dtype=np.float32)
+        scales    = np.full((n, 3), 0.05, dtype=np.float32)
+        rotations = np.zeros((n, 4), dtype=np.float32)
+        rotations[:, 0] = 1.0                                   # identity quat
+        opacities = np.full(n, 0.8, dtype=np.float32)
+        return means, scales, rotations, opacities, None
+
     def _trigger_usd_export(self, final: bool = False) -> None:
         """Snapshot the current Gaussian buffer + latest collision mesh to .usdz.
 
@@ -551,15 +696,11 @@ class PipelineManager:
         logger.info("USD export %s (frame=%d) …", label, self.frames_processed)
 
         # ---- Gaussian splat layer ----
-        positions = list(self._gaussian_positions)   # snapshot the deque
-        if positions:
-            n = len(positions)
-            means     = np.array(positions,        dtype=np.float32)          # (N, 3)
-            scales    = np.full((n, 3), 0.05,      dtype=np.float32)
-            rotations = np.zeros((n, 4),            dtype=np.float32)
-            rotations[:, 0] = 1.0                                              # identity quat
-            opacities = np.full(n, 0.8,            dtype=np.float32)
-            self._usd_bridge.update_gaussian_splats(means, scales, rotations, opacities)
+        arrays = self._splat_export_arrays()
+        if arrays is not None:
+            means, scales, rotations, opacities, sh = arrays
+            self._usd_bridge.update_gaussian_splats(
+                means, scales, rotations, opacities, sh_coeffs=sh)
 
         # ---- Collision mesh layer ----
         mesh = self._collision_extractor.get_latest_mesh()
