@@ -31,6 +31,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from . import tsdf_cuda
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -97,6 +99,11 @@ class TSDFVolume:
     origin : ndarray, optional
         World-space coordinates of voxel [0,0,0]. Defaults to centering the
         volume in front of the camera.
+    use_cuda : bool, optional
+        Integrate with the custom CUDA kernel, keeping the volume resident on
+        the GPU and syncing to host only for mesh/occupancy extraction. ``None``
+        (default) auto-detects (`tsdf_cuda.available()`); ``True`` requires it
+        and raises if unavailable; ``False`` forces the numpy path.
     """
 
     def __init__(
@@ -105,6 +112,7 @@ class TSDFVolume:
         grid_dim: int = 64,
         trunc: float = 0.10,
         origin: Optional[np.ndarray] = None,
+        use_cuda: Optional[bool] = None,
     ):
         self.voxel_size = float(voxel_size)
         self.grid_dim = int(grid_dim)
@@ -133,6 +141,61 @@ class TSDFVolume:
             + self.origin
         )  # (N³, 3) — built once, reused every integrate() call
 
+        # --- Optional GPU-resident volume (custom CUDA integrate kernel) ---
+        if use_cuda is None:
+            self.use_cuda = tsdf_cuda.available()
+        elif use_cuda:
+            if not tsdf_cuda.available():
+                raise RuntimeError(
+                    "use_cuda=True but the CUDA TSDF kernel is unavailable "
+                    "(build with `python setup.py build_ext --inplace`)")
+            self.use_cuda = True
+        else:
+            self.use_cuda = False
+
+        self._torch = None
+        self._tsdf_t = None          # flat (N³,) CUDA tensors — source of truth
+        self._weight_t = None        #   when use_cuda; host arrays are a mirror
+        self._host_dirty = False     # host mirror stale vs GPU?
+        if self.use_cuda:
+            import torch
+            self._torch = torch
+            dev = torch.device("cuda")
+            self._tsdf_t = torch.ones(N * N * N, dtype=torch.float32, device=dev)
+            self._weight_t = torch.zeros(N * N * N, dtype=torch.float32, device=dev)
+
+    # ------------------------------------------------------------------
+
+    def _sync_host(self) -> None:
+        """Copy the GPU volume down into the numpy mirror if it has drifted.
+
+        A no-op on the numpy path. Called before any host-side read
+        (mesh/occupancy) so those methods keep operating on `_tsdf`/`_weight`
+        unchanged.
+        """
+        if self.use_cuda and self._host_dirty:
+            N = self.grid_dim
+            self._tsdf = self._tsdf_t.cpu().numpy().reshape(N, N, N)
+            self._weight = self._weight_t.cpu().numpy().reshape(N, N, N)
+            self._host_dirty = False
+
+    def _integrate_cuda(self, depth, K, pose) -> None:
+        """Integrate one frame on the GPU; only depth crosses the PCIe bus."""
+        if pose is None:
+            pose = _IDENTITY_POSE
+        torch = self._torch
+        dev = self._tsdf_t.device
+        depth_t = torch.from_numpy(
+            np.ascontiguousarray(depth, dtype=np.float32)).to(dev)
+        R_t = torch.from_numpy(
+            np.ascontiguousarray(pose[:3, :3], dtype=np.float32)).to(dev)
+        t_t = torch.from_numpy(
+            np.ascontiguousarray(pose[:3, 3], dtype=np.float32)).to(dev)
+        tsdf_cuda.integrate_cuda(
+            self._tsdf_t, self._weight_t, depth_t, R_t, t_t,
+            self.grid_dim, self.voxel_size, self.origin, K, self.trunc)
+        self._host_dirty = True
+
     # ------------------------------------------------------------------
 
     def integrate(
@@ -149,6 +212,10 @@ class TSDFVolume:
         K : CameraIntrinsics
         pose : (4,4) camera-to-world transform. Identity = fixed camera.
         """
+        if self.use_cuda:
+            self._integrate_cuda(depth, K, pose)
+            return
+
         if pose is None:
             pose = _IDENTITY_POSE
 
@@ -215,6 +282,7 @@ class TSDFVolume:
         except ImportError:
             raise ImportError("scikit-image required. pip install scikit-image")
 
+        self._sync_host()
         # Treat unobserved voxels as free space so they don't generate spurious surface
         tsdf = np.where(self._weight > 0, self._tsdf, 1.0)
 
@@ -253,6 +321,7 @@ class TSDFVolume:
         -------
         ndarray (N, N) int8 indexed [X, Z] (with the default vertical_axis).
         """
+        self._sync_host()
         observed = self._weight > 0
         occupied_vox = observed & (self._tsdf <= surface_level)
         col_observed = observed.any(axis=vertical_axis)
@@ -266,6 +335,10 @@ class TSDFVolume:
     def reset(self) -> None:
         self._tsdf[:] = 1.0
         self._weight[:] = 0.0
+        if self.use_cuda:
+            self._tsdf_t.fill_(1.0)
+            self._weight_t.fill_(0.0)
+            self._host_dirty = False
 
 
 # ---------------------------------------------------------------------------

@@ -122,3 +122,34 @@ def test_cuda_matches_reference():
 
     np.testing.assert_allclose(tsdf_t.cpu().numpy(), ref_tsdf, rtol=0, atol=1e-4)
     np.testing.assert_array_equal(weight_t.cpu().numpy(), ref_weight)
+
+
+@pytest.mark.skipif(not tsdf_cuda.available(), reason="CUDA extension unavailable")
+def test_tsdf_volume_cuda_matches_numpy():
+    """A GPU-resident TSDFVolume produces the same downstream outputs (synced
+    TSDF/weight, occupancy grid, mesh) as the numpy volume over several frames."""
+    K = CameraIntrinsics.from_fov(70.0, 96, 96)
+    rng = np.random.default_rng(3)
+    poses = [_pose(0.0, [0, 0, 0]), _pose(10.0, [0.2, 0, 0.1]),
+             _pose(-8.0, [-0.1, 0.05, 0.0])]
+    depths = [_synthetic_depth(K, rng) for _ in poses]
+
+    cpu = TSDFVolume(voxel_size=0.05, grid_dim=48, use_cuda=False)
+    gpu = TSDFVolume(voxel_size=0.05, grid_dim=48, use_cuda=True)
+    assert gpu.use_cuda and not cpu.use_cuda
+
+    for depth, pose in zip(depths, poses):
+        cpu.integrate(depth, K, pose)
+        gpu.integrate(depth, K, pose)
+
+    # Host mirror is stale until a read triggers _sync_host().
+    assert gpu._host_dirty
+    np.testing.assert_array_equal(gpu.occupancy_grid_2d(), cpu.occupancy_grid_2d())
+    assert not gpu._host_dirty
+    np.testing.assert_allclose(gpu._tsdf, cpu._tsdf, rtol=0, atol=1e-4)
+    np.testing.assert_array_equal(gpu._weight, cpu._weight)
+
+    mesh_cpu, mesh_gpu = cpu.extract_mesh(), gpu.extract_mesh()
+    assert (mesh_cpu is None) == (mesh_gpu is None)
+    if mesh_cpu is not None:
+        assert mesh_gpu.vertices.shape == mesh_cpu.vertices.shape
