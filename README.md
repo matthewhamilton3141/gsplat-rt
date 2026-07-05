@@ -2,7 +2,7 @@
 
 Real-time conversion of live video into 3D Gaussian Splats with a physics-ready collision mesh, exported as an OpenUSD stage for NVIDIA Isaac Sim and Omniverse.
 
-> **Status: work in progress.** The pipeline runs end-to-end and is now **benchmarked on real hardware — 34.7 FPS on an NVIDIA A10G** (28.9 ms/frame), clearing the 30 FPS real-time budget, with TensorRT depth inference at **14.3 ms/frame**. A Python-only mock depth estimator keeps everything runnable GPU-free. The **M6 SLAM front-end is built**: an RGB-D visual-odometry tracker (5.6 cm ATE on TUM fr1/desk) supplies per-frame camera poses to pose-aware TSDF + Gaussian fusion. Not yet built: the M5 Gaussian optimizer, true FP16 depth, and a CUDA TSDF kernel (the one stage still over its per-call budget). See [Measured performance](#measured-performance-nvidia-a10g) and [Roadmap](#roadmap).
+> **Status: work in progress.** The pipeline runs end-to-end and is now **benchmarked on real hardware — 34.7 FPS on an NVIDIA A10G** (28.9 ms/frame), clearing the 30 FPS real-time budget, with TensorRT depth inference at **14.3 ms/frame**. A Python-only mock depth estimator keeps everything runnable GPU-free. The **M6 SLAM front-end is built**: an RGB-D visual-odometry tracker (5.6 cm ATE on TUM fr1/desk) supplies per-frame camera poses to pose-aware TSDF + Gaussian fusion. The **M5 Gaussian optimizer is built**: a differentiable 3DGS rasterizer with hand-derived analytic gradients (finite-difference verified) and an Adam training loop that reconstructs held-out views to >60 dB PSNR. Not yet built: true FP16 depth and a CUDA TSDF kernel (the one stage still over its per-call budget). See [Measured performance](#measured-performance-nvidia-a10g) and [Roadmap](#roadmap).
 
 ## What it does
 
@@ -237,7 +237,7 @@ The project targets an FP16 depth engine. TensorRT 10+/11 removed the weakly-typ
 - **CUDA TSDF kernel** — replace the numpy 64³ integrator (the one over-budget stage, 13 ms) with a custom kernel in `kernels/`, targeting sub-millisecond.
 - **True FP16 depth** — export an fp16 ONNX and build a `STRONGLY_TYPED` engine so TensorRT 11 runs genuine FP16 (~8–10 ms) rather than TF32.
 - **M6 — SLAM pose tracking** — *front-end done*: RGB-D visual odometry (`src/slam/`, ORB+PnP, 5.6 cm ATE on TUM fr1/desk) feeds per-frame poses into pose-aware fusion. Next: a learned front-end (SuperPoint + SuperGlue), keyframing / loop closure, and closing the monocular scale gap so poses work on the live mono-depth path, not just metric RGB-D.
-- **M5 — Gaussian optimizer** — differentiable 3DGS optimization on the accumulated point cloud (`src/gaussian/` is stubbed)
+- **M5 — Gaussian optimizer** — *built*: a differentiable EWA-splatting rasterizer with hand-derived analytic gradients (verified against finite differences to <1e-4) and a numpy Adam loop (`src/gaussian/`). Fits posed views to >60 dB PSNR at ~2 ms/iter on CPU; ports to CUDA/torch on the A10G unchanged. Next: adaptive densify/prune, D-SSIM loss, SH colour, and initialising from the pipeline's fused point cloud.
 - **M7 — Isaac Sim live reload** — hot-swap the `.usdz` stage in Omniverse as new geometry arrives, without restarting the simulation
 
 ## License
