@@ -19,11 +19,18 @@ _PROBED = False
 
 
 def _load_ext():
-    """Import the compiled extension once; cache the result (or None)."""
+    """Import the compiled extension once; cache the result (or None).
+
+    torch must be imported *first*: the extension links against torch's runtime
+    (libc10/libtorch), which only lands in the process's symbol namespace once
+    torch is loaded. Importing the extension first fails with
+    `ImportError: libc10.so: cannot open shared object file`.
+    """
     global _EXT, _PROBED
     if not _PROBED:
         _PROBED = True
         try:
+            import torch  # noqa: F401 — preload libc10/libtorch for the ext below
             import gaussian_kernels  # built by setup.py on a CUDA box
             _EXT = gaussian_kernels
         except Exception:
