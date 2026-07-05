@@ -8,6 +8,7 @@ huggingface_hub>=0.22.0
 onnx>=1.14.0
 onnxruntime-gpu>=1.16.0
 onnxscript>=0.1.0          # required by torch.onnx.export on torch 2.x
+onnxconverter-common>=1.14.0  # fp32→fp16 ONNX for strongly-typed FP16 engine
 # TensorRT: install via NVIDIA wheel (requires CUDA toolkit on Linux):
 #   pip install tensorrt --extra-index-url https://pypi.ngc.nvidia.com
 # Minimum: tensorrt>=9.0.0  (uses IExecutionContext v3 API)

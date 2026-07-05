@@ -75,15 +75,29 @@ EOF
 if [ -f models/depth_v2_small.onnx ]; then
     log "ONNX model already exported — skipping"
 else
-    log "Exporting Depth Anything V2 Small to ONNX (downloads ~100 MB from HuggingFace)"
-    python3 src/depth/export_onnx.py
+    log "Exporting Depth Anything V2 Small to ONNX + fp16 (downloads ~100 MB from HuggingFace)"
+    python3 src/depth/export_onnx.py --fp16
+fi
+
+# fp16 ONNX may be missing on boxes provisioned before the --fp16 flag existed.
+if [ ! -f models/depth_v2_small_fp16.onnx ]; then
+    log "Converting fp32 ONNX → fp16"
+    python3 -c "from src.depth.export_onnx import to_fp16; to_fp16()" \
+        || python3 -c "import sys; sys.path.insert(0,'src'); from depth.export_onnx import to_fp16; to_fp16()"
 fi
 
 if [ -f models/depth_engine.engine ]; then
-    log "TensorRT engine already built — skipping (delete models/depth_engine.engine to rebuild)"
+    log "TensorRT engine (TF32) already built — skipping (delete to rebuild)"
 else
-    log "Building TensorRT FP16 engine (2-5 minutes)"
+    log "Building TensorRT engine — default (TF32 on Ampere) (2-5 minutes)"
     python3 src/depth/compile_trt.py
+fi
+
+if [ -f models/depth_engine_fp16.engine ]; then
+    log "TensorRT engine (FP16 strongly-typed) already built — skipping"
+else
+    log "Building TensorRT engine — true FP16 strongly-typed (2-5 minutes)"
+    python3 src/depth/compile_trt.py --fp16
 fi
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ OPSET = 17
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 DEFAULT_ONNX_PATH = os.path.join(_ROOT, "models", "depth_v2_small.onnx")
+FP16_ONNX_PATH = os.path.join(_ROOT, "models", "depth_v2_small_fp16.onnx")
 
 
 class _DepthWrapper(torch.nn.Module):
@@ -95,8 +96,40 @@ def export(onnx_path: str = DEFAULT_ONNX_PATH) -> None:
     print(f"[export] Output: depth         (1, 1, {INPUT_H}, {INPUT_W})  float32")
 
 
+def to_fp16(src_path: str = DEFAULT_ONNX_PATH,
+            dst_path: str = FP16_ONNX_PATH,
+            keep_io_types: bool = True) -> None:
+    """Convert the fp32 ONNX to fp16 for a strongly-typed TensorRT FP16 build.
+
+    ``keep_io_types=True`` inserts fp32↔fp16 cast nodes at the graph boundary so
+    the engine's input/output bindings stay float32 — ``DepthEstimator``'s
+    pre-allocated fp32 buffers keep working unchanged — while every internal
+    conv/GEMM runs in half precision. Precision-sensitive ops (the library's
+    default block list) are left in fp32 to protect accuracy.
+    """
+    from onnxconverter_common import float16
+
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(
+            f"fp32 ONNX not found: {src_path}\nRun: python src/depth/export_onnx.py")
+
+    print(f"[fp16] Loading {src_path}")
+    model = onnx.load(src_path)
+    model16 = float16.convert_float_to_float16(model, keep_io_types=keep_io_types)
+    onnx.checker.check_model(model16)
+    onnx.save(model16, dst_path)
+
+    size_mb = os.path.getsize(dst_path) / 1e6
+    print(f"[fp16] OK — {dst_path}  ({size_mb:.1f} MB)  "
+          f"(I/O kept float32; internals fp16)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export Depth Anything V2 Small to ONNX")
     parser.add_argument("--output", default=DEFAULT_ONNX_PATH, help="Destination .onnx path")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Also emit an fp16 ONNX (for a strongly-typed FP16 engine)")
     args = parser.parse_args()
     export(args.output)
+    if args.fp16:
+        to_fp16(args.output, FP16_ONNX_PATH)

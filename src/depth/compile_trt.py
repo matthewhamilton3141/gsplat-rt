@@ -20,6 +20,9 @@ import time
 _ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 DEFAULT_ONNX_PATH = os.path.join(_ROOT, "models", "depth_v2_small.onnx")
 DEFAULT_ENGINE_PATH = os.path.join(_ROOT, "models", "depth_engine.engine")
+# Strongly-typed FP16 pair (built from the fp16 ONNX; see export_onnx.to_fp16).
+DEFAULT_FP16_ONNX_PATH = os.path.join(_ROOT, "models", "depth_v2_small_fp16.onnx")
+DEFAULT_FP16_ENGINE_PATH = os.path.join(_ROOT, "models", "depth_engine_fp16.engine")
 
 # Fixed I/O shapes matching export_onnx.py
 INPUT_H = 518
@@ -27,10 +30,35 @@ INPUT_W = 518
 FIXED_SHAPE = (1, 3, INPUT_H, INPUT_W)
 
 
+def make_network_flags(trt_module, strongly_typed: bool) -> int:
+    """Compute the createNetwork flag bitmask, portable across TRT versions.
+
+    - EXPLICIT_BATCH: required on TRT 8/9, removed (implicit default) on TRT 10+.
+    - STRONGLY_TYPED (TRT 10+): the network's precision comes from the ONNX's own
+      dtypes rather than builder flags — this is how true FP16 is expressed once
+      the weakly-typed ``BuilderFlag.FP16`` was removed. Requires an fp16 ONNX.
+
+    Pure/side-effect-free so it can be unit-tested with a fake ``trt`` module on
+    machines without TensorRT installed.
+    """
+    flags = 0
+    ndcf = trt_module.NetworkDefinitionCreationFlag
+    if hasattr(ndcf, "EXPLICIT_BATCH"):
+        flags |= 1 << int(ndcf.EXPLICIT_BATCH)
+    if strongly_typed:
+        if not hasattr(ndcf, "STRONGLY_TYPED"):
+            raise ValueError(
+                "strongly_typed=True requires TensorRT 10+ (STRONGLY_TYPED "
+                f"network flag absent). Build the default engine instead.")
+        flags |= 1 << int(ndcf.STRONGLY_TYPED)
+    return flags
+
+
 def build_engine(
     onnx_path: str = DEFAULT_ONNX_PATH,
     engine_path: str = DEFAULT_ENGINE_PATH,
     workspace_gb: int = 4,
+    strongly_typed: bool = False,
 ) -> None:
     try:
         import tensorrt as trt
@@ -57,12 +85,9 @@ def build_engine(
     print(f"[compile] Workspace: {workspace_gb} GiB")
 
     builder = trt.Builder(logger)
-    # EXPLICIT_BATCH was removed in TensorRT 10 (explicit batch is the only mode,
-    # flags=0). On TRT 8/9 the flag is still required. Guard so this builds on
-    # whichever version the NGC index resolves to.
-    network_flags = 0
-    if hasattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH"):
-        network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    # Network creation flags (EXPLICIT_BATCH / STRONGLY_TYPED) are computed in a
+    # version-portable, unit-testable helper.
+    network_flags = make_network_flags(trt, strongly_typed)
     network = builder.create_network(network_flags)
     parser = trt.OnnxParser(network, logger)
     config = builder.create_builder_config()
@@ -72,21 +97,25 @@ def build_engine(
 
     # Precision, portable across TensorRT major versions.
     #
+    # strongly_typed (TRT 10/11, from an fp16 ONNX): the network dictates its own
+    #   precision — TRT runs conv/GEMM in the ONNX's declared fp16. Builder
+    #   precision flags are invalid on a strongly-typed network, so we set none.
     # TRT 8/9 (weakly typed): set BuilderFlag.FP16 to let TRT run GEMM/conv on
     #   Tensor Cores in half precision, keeping precision-sensitive layers in fp32.
-    # TRT 10/11: the weakly-typed FP16/INT8 flags were removed — precision now
-    #   comes from strongly-typed networks (the ONNX's own dtypes). With our fp32
-    #   ONNX the engine builds in fp32, which on Ampere still uses Tensor Cores via
-    #   TF32 (enabled by default). True FP16 there means an fp16 ONNX + a
-    #   STRONGLY_TYPED network — a follow-up if TF32 misses the latency budget.
-    if hasattr(trt.BuilderFlag, "FP16"):
+    # TRT 10/11 with the fp32 ONNX (default): the weakly-typed FP16 flag was
+    #   removed; the engine builds fp32, which on Ampere still uses Tensor Cores
+    #   via TF32. True FP16 there is the strongly_typed path above.
+    if strongly_typed:
+        print("[compile] Precision: FP16 (strongly-typed — from the fp16 ONNX's dtypes)")
+    elif hasattr(trt.BuilderFlag, "FP16"):
         if hasattr(builder, "platform_has_fast_fp16") and not builder.platform_has_fast_fp16:
             print("[compile] WARNING: GPU does not report fast FP16; engine will be slower")
         config.set_flag(trt.BuilderFlag.FP16)
-        print("[compile] Precision: FP16")
+        print("[compile] Precision: FP16 (weakly-typed flag)")
     else:
         print("[compile] Precision: default fp32 (TF32 Tensor Cores on Ampere) — "
-              "weakly-typed FP16 flag absent in TensorRT %s" % trt.__version__)
+              "weakly-typed FP16 flag absent in TensorRT %s; use --fp16 for true FP16"
+              % trt.__version__)
 
     with open(onnx_path, "rb") as f:
         raw = f.read()
@@ -118,9 +147,19 @@ def build_engine(
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Build TensorRT FP16 depth engine")
-    ap.add_argument("--onnx", default=DEFAULT_ONNX_PATH)
-    ap.add_argument("--engine", default=DEFAULT_ENGINE_PATH)
+    ap = argparse.ArgumentParser(description="Build a TensorRT depth engine")
+    ap.add_argument("--onnx", default=None,
+                    help="ONNX path (default: fp16 ONNX under --fp16, else fp32)")
+    ap.add_argument("--engine", default=None,
+                    help="Output engine path (default depends on --fp16)")
     ap.add_argument("--workspace-gb", type=int, default=4)
+    ap.add_argument("--fp16", action="store_true",
+                    help="Build a true-FP16 strongly-typed engine from the fp16 "
+                         "ONNX (TensorRT 10+). Run export_onnx.py --fp16 first.")
     args = ap.parse_args()
-    build_engine(args.onnx, args.engine, args.workspace_gb)
+
+    # --fp16 flips the default onnx/engine pair to the fp16 artifacts, but an
+    # explicit --onnx/--engine still wins.
+    onnx_path = args.onnx or (DEFAULT_FP16_ONNX_PATH if args.fp16 else DEFAULT_ONNX_PATH)
+    engine_path = args.engine or (DEFAULT_FP16_ENGINE_PATH if args.fp16 else DEFAULT_ENGINE_PATH)
+    build_engine(onnx_path, engine_path, args.workspace_gb, strongly_typed=args.fp16)
