@@ -59,9 +59,11 @@ def test_pipeline_finalizes_and_writes_ply():
             usd_update_interval_s=60.0, usd_update_frame_count=1000,
             tsdf_grid_dim=32, tsdf_voxel_size=0.10, write_previews=False,
             optimize_on_finalize=True,
-            # Short interval so keyframes land well within the run window
-            # regardless of how many frames the mock depth estimator clears.
-            keyframe_interval=5, max_keyframes=3,
+            # Capture every processed frame: under CPU contention (e.g. the full
+            # suite) the mock estimator may only clear a handful of frames in the
+            # run window, so a larger interval can race to zero keyframes. This
+            # makes the test depend only on "frames > 0", like the pose test.
+            keyframe_interval=1, max_keyframes=3,
             finalize_res=48, finalize_iters=40, finalize_max_points=800,
         )
         pm = PipelineManager(cfg, pose_provider=provider)
