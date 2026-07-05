@@ -62,10 +62,12 @@ def test_reference_matches_vectorized_single():
     depth = _synthetic_depth(K, rng)
     pose = _pose(15.0, [0.1, -0.05, 0.0])
 
-    ref = TSDFVolume(voxel_size=0.05, grid_dim=24)
+    ref = TSDFVolume(voxel_size=0.05, grid_dim=24, use_cuda=False)
     ref_tsdf, ref_weight = _run_reference(ref, depth, K, pose)
 
-    prod = TSDFVolume(voxel_size=0.05, grid_dim=24)
+    # Pin the *numpy* path: on a GPU box TSDFVolume auto-detects CUDA, whose
+    # host mirror is stale until a read syncs it — not what this oracle asserts.
+    prod = TSDFVolume(voxel_size=0.05, grid_dim=24, use_cuda=False)
     prod.integrate(depth, K, pose)
 
     # Some voxel must actually have been observed, else the test is vacuous.
@@ -80,8 +82,8 @@ def test_reference_matches_vectorized_multi():
     poses = [_pose(0.0, [0, 0, 0]), _pose(10.0, [0.2, 0, 0.1]),
              _pose(-8.0, [-0.1, 0.05, 0.0])]
 
-    ref = TSDFVolume(voxel_size=0.05, grid_dim=24)
-    prod = TSDFVolume(voxel_size=0.05, grid_dim=24)
+    ref = TSDFVolume(voxel_size=0.05, grid_dim=24, use_cuda=False)
+    prod = TSDFVolume(voxel_size=0.05, grid_dim=24, use_cuda=False)
     ref_tsdf = ref._tsdf.ravel().copy()
     ref_weight = ref._weight.ravel().copy()
 
@@ -106,7 +108,7 @@ def test_cuda_matches_reference():
     depth = _synthetic_depth(K, rng)
     pose = _pose(12.0, [0.15, -0.05, 0.05])
 
-    vol = TSDFVolume(voxel_size=0.05, grid_dim=64)
+    vol = TSDFVolume(voxel_size=0.05, grid_dim=64, use_cuda=False)  # host container only
     ref_tsdf, ref_weight = _run_reference(vol, depth, K, pose)
 
     dev = torch.device("cuda")
