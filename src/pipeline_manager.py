@@ -545,6 +545,13 @@ class PipelineManager:
             return None
         return self._collision_extractor.get_latest_occupancy()
 
+    def latest_gaussians(self) -> Optional[np.ndarray]:
+        """Snapshot of the accumulated Gaussian centres as an (N, 3) array, or
+        None if empty. Copies the ring buffer, so it's safe to call from another
+        thread (e.g. the web viewer) while the coordinator keeps appending."""
+        pts = list(self._gaussian_positions)   # deque copy is GIL-atomic
+        return np.asarray(pts, dtype=np.float64) if pts else None
+
     # ------------------------------------------------------------------
     # Core pipeline loop
     # ------------------------------------------------------------------

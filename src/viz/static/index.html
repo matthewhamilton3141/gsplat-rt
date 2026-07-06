@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>gsplat-rt · live viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden;
+      font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: #0b0d10; color: #d7dde3; }
+    #view { position: fixed; inset: 0; }
+    .panel { position: fixed; background: rgba(16,19,24,.82);
+      border: 1px solid #232a33; border-radius: 8px; padding: 10px 12px;
+      backdrop-filter: blur(6px); }
+    #hud { top: 12px; left: 12px; min-width: 190px; }
+    #hud h1 { margin: 0 0 6px; font-size: 13px; letter-spacing: .06em;
+      color: #7ee3c7; text-transform: uppercase; }
+    #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+    #hud .k { color: #8a95a1; }
+    #hud .v { color: #eef3f7; }
+    #occ { bottom: 12px; left: 12px; }
+    #occ .cap { color: #8a95a1; margin-bottom: 6px; }
+    #occCanvas { display: block; image-rendering: pixelated;
+      width: 180px; height: 180px; background: #0e1116; border-radius: 4px; }
+    #help { bottom: 12px; right: 12px; color: #6a7683; text-align: right;
+      max-width: 240px; }
+    .off { color: #55606b; }
+    #status { color: #f0b072; }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <div id="hud" class="panel">
+    <h1>gsplat-rt</h1>
+    <div class="row"><span class="k">source</span><span class="v" id="s-source">—</span></div>
+    <div class="row"><span class="k">splats</span><span class="v" id="s-count">0</span></div>
+    <div class="row"><span class="k">fps</span><span class="v" id="s-fps">—</span></div>
+    <div class="row"><span class="k">depth ms</span><span class="v" id="s-depth">—</span></div>
+    <div class="row"><span class="k">backend</span><span class="v" id="s-backend">—</span></div>
+    <div class="row"><span class="k">frames</span><span class="v" id="s-frames">—</span></div>
+    <div class="row"><span class="k">metric s</span><span class="v" id="s-scale">—</span></div>
+    <div class="row" style="margin-top:6px"><span class="k">viewer</span><span class="v" id="status">connecting…</span></div>
+  </div>
+
+  <div id="occ" class="panel">
+    <div class="cap">top-down occupancy</div>
+    <canvas id="occCanvas" width="64" height="64"></canvas>
+  </div>
+
+  <div id="help" class="panel">
+    drag to orbit · scroll to zoom · right-drag to pan<br />
+    <span class="off">soft discs are Gaussian splats, sized by scale</span>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>
