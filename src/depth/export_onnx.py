@@ -132,12 +132,15 @@ def to_fp16(src_path: str = DEFAULT_ONNX_PATH,
         model, keep_io_types=keep_io_types, op_block_list=block)
 
     if not keep_io_types:
-        # onnxconverter_common converts every *weight* to fp16 but (in this
-        # version) leaves the graph inputs/outputs declared float32 and inserts
-        # no boundary cast — so the first conv gets an fp32 activation into an
-        # fp16 kernel, which a strongly-typed TensorRT network rejects. Force the
-        # I/O tensor types to fp16 ourselves so the graph is genuinely uniform.
-        _force_io_fp16(model16)
+        # onnxconverter_common converts the weights but leaves three fp32 leftovers
+        # that break a strongly-typed parse (which permits no auto-casts):
+        #   1. graph I/O declared float32,
+        #   2. the graph's own `Cast(to=fp32)` nodes — Depth Anything casts the
+        #      input to the (formerly fp32) weight dtype, so a fp16 activation is
+        #      cast straight back to fp32 into the fp16 conv,
+        #   3. intermediate value_info annotated float32.
+        # Retarget all three to fp16 so the float graph is genuinely uniform.
+        _make_graph_uniform_fp16(model16)
 
     onnx.checker.check_model(model16)
     onnx.save(model16, dst_path)
@@ -147,15 +150,36 @@ def to_fp16(src_path: str = DEFAULT_ONNX_PATH,
     print(f"[fp16] OK — {dst_path}  ({size_mb:.1f} MB)  ({io})")
 
 
-def _force_io_fp16(model) -> None:
-    """Set every graph input/output tensor's element type to FLOAT16 in place."""
+def _make_graph_uniform_fp16(model) -> None:
+    """Retarget every fp32 leftover (I/O, Cast-to-fp32, value_info) to fp16."""
     fp32 = onnx.TensorProto.FLOAT
     fp16 = onnx.TensorProto.FLOAT16
-    for vi in list(model.graph.input) + list(model.graph.output):
+    g = model.graph
+
+    for vi in list(g.input) + list(g.output):
         tt = vi.type.tensor_type
         if tt.elem_type == fp32:
             tt.elem_type = fp16
             print(f"[fp16]   forced I/O tensor '{vi.name}' float32 → float16")
+
+    n_cast = 0
+    for node in g.node:
+        if node.op_type == "Cast":
+            for attr in node.attribute:
+                if attr.name == "to" and attr.i == fp32:
+                    attr.i = fp16              # e.g. the input→weight-dtype cast
+                    n_cast += 1
+    if n_cast:
+        print(f"[fp16]   retargeted {n_cast} Cast(to=float32) → float16")
+
+    n_vi = 0
+    for vi in g.value_info:
+        tt = vi.type.tensor_type
+        if tt.elem_type == fp32:
+            tt.elem_type = fp16
+            n_vi += 1
+    if n_vi:
+        print(f"[fp16]   retagged {n_vi} intermediate value_info float32 → float16")
 
 
 if __name__ == "__main__":
