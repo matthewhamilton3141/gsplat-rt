@@ -177,6 +177,9 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=200, help="iterations per stage benchmark")
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--out", default=os.path.join("output", "bench_results.json"))
+    ap.add_argument("--engine", default=None,
+                    help="TensorRT engine path (e.g. models/depth_engine_fp16.engine "
+                         "for the FP16 pipeline); defaults to PipelineConfig's engine")
     ap.add_argument("--strict", action="store_true", help="exit 1 if any budget is missed")
     args = ap.parse_args()
 
@@ -187,10 +190,12 @@ def main() -> int:
     _make_video(video_path, args.frames * 4)
 
     try:
+        engine_kw = {"engine_path": args.engine} if args.engine else {}
         cfg = PipelineConfig(
             video_source=video_path,
             output_dir=tempfile.mkdtemp(prefix="bench_usd_"),
             usd_update_interval_s=3.0,
+            **engine_kw,
         )
 
         # Stage benchmarks reuse a started-then-idle manager's components
@@ -210,6 +215,7 @@ def main() -> int:
             video_source=video_path,
             output_dir=tempfile.mkdtemp(prefix="bench_usd_tp_"),
             usd_update_interval_s=3.0,
+            **engine_kw,
         )
         throughput = bench_throughput(throughput_cfg, args.frames, timeout_s=120.0)
 
