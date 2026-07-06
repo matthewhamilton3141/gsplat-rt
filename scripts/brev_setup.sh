@@ -86,26 +86,34 @@ if [ ! -f models/depth_v2_small_fp16.onnx ]; then
         || python3 -c "import sys; sys.path.insert(0,'src'); from depth.export_onnx import to_fp16; to_fp16()"
 fi
 
+# The engine builds are wrapped so a failure warns but never aborts the rest of
+# the bootstrap (kernel build, TUM fetch, tests). With `set -e` an unguarded
+# failure here would kill the whole script — which is exactly how a broken FP16
+# build once left a box with no CUDA kernel and no dataset.
 if [ -f models/depth_engine.engine ]; then
     log "TensorRT engine (TF32) already built — skipping (delete to rebuild)"
 else
     log "Building TensorRT engine — default (TF32 on Ampere) (2-5 minutes)"
-    python3 src/depth/compile_trt.py
+    python3 src/depth/compile_trt.py \
+        || log "WARNING: TF32 engine build failed — pipeline falls back to the mock estimator"
 fi
 
 if [ -f models/depth_engine_fp16.engine ]; then
     log "TensorRT engine (FP16 strongly-typed) already built — skipping"
 else
     log "Building TensorRT engine — true FP16 strongly-typed (2-5 minutes)"
-    python3 src/depth/compile_trt.py --fp16
+    python3 src/depth/compile_trt.py --fp16 \
+        || log "WARNING: FP16 engine build failed — continuing without it (TF32 engine still usable)"
 fi
 
 # ---------------------------------------------------------------------------
 # 4. Custom CUDA kernels (no-op while kernels/ has no .cu files)
 # ---------------------------------------------------------------------------
 if ls kernels/*.cu >/dev/null 2>&1; then
-    log "Compiling custom CUDA kernels"
-    python3 setup.py build_ext --inplace
+    log "Compiling custom CUDA kernels (CUDA TSDF integrate)"
+    python3 setup.py build_ext --inplace \
+        && python3 -c "import sys; sys.path.insert(0,'src'); from mapping import tsdf_cuda; assert tsdf_cuda.available(); print('[brev_setup] CUDA TSDF kernel: available')" \
+        || log "WARNING: CUDA kernel build/import failed — TSDF falls back to numpy (~13 ms vs 0.3 ms)"
 else
     log "No .cu files in kernels/ — skipping kernel build"
 fi
@@ -116,7 +124,8 @@ fi
 # Set FETCH_TUM=0 to skip (e.g. a depth-only benchmark run).
 if [ "${FETCH_TUM:-1}" = "1" ]; then
     log "Fetching TUM ${TUM_SEQ:-freiburg1_desk} for SLAM work"
-    bash scripts/fetch_tum.sh "${TUM_SEQ:-freiburg1_desk}"
+    bash scripts/fetch_tum.sh "${TUM_SEQ:-freiburg1_desk}" \
+        || log "WARNING: TUM fetch failed — SLAM/metric-scale eval will skip (re-run scripts/fetch_tum.sh)"
 else
     log "FETCH_TUM=0 — skipping TUM dataset download"
 fi
@@ -125,6 +134,10 @@ fi
 # 5. Full test suite (GPU benchmarks included)
 # ---------------------------------------------------------------------------
 log "Running full test suite"
-python3 -m pytest tests/ -v
+python3 -m pytest tests/ -v \
+    || log "WARNING: some tests failed — see output above"
 
-log "Done. Next: python3 scripts/bench_pipeline.py --out output/bench_results.json"
+log "Done. Next:"
+log "  FP16 pipeline bench : python3 scripts/bench_pipeline.py --engine models/depth_engine_fp16.engine --out output/bench_results.json"
+log "  depth TF32 vs FP16  : python3 scripts/bench_depth.py --frames 200"
+log "  TUM metric scale    : python3 scripts/eval_metric_scale.py --tum data/tum/rgbd_dataset_freiburg1_desk"
