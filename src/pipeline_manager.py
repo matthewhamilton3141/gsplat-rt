@@ -119,6 +119,30 @@ class PipelineConfig:
     finalize_max_points: int = 2000
     """Cap on Gaussians seeded from the accumulated cloud during finalize."""
 
+    # ---- Monocular metric scale (relative → metric depth) ----
+    metric_scale_enabled: bool = False
+    """Insert the scale/shift aligner between depth inference and the
+    pose/TSDF/Gaussian consumers, turning Depth Anything's *relative* depth into
+    *metric* depth. Off by default → existing RGB-D/TUM runs (already metric) are
+    unchanged. Requires a ``scale_reference`` provider (see PipelineManager) to
+    supply the per-frame metric anchor; without one the aligner just passes depth
+    through (identity), so enabling this alone is a no-op."""
+
+    metric_scale_space: str = "disparity"
+    """'disparity' (Depth Anything's output is inverse-depth) or 'depth'."""
+
+    metric_scale_smoothing: float = 0.7
+    """EMA weight on the previous (scale, shift) for frame-to-frame stability."""
+
+    metric_scale_robust: bool = True
+    """Huber-IRLS reweighting in the fit (robust to bad reference points)."""
+
+    metric_scale_min_points: int = 20
+    """Minimum valid reference points to accept a fit; else coast on last scale."""
+
+    metric_scale_clamp: tuple = (0.05, 100.0)
+    """(min, max) metres clamp applied to aligned depth, or None to disable."""
+
 
 # ---------------------------------------------------------------------------
 # Mock depth estimator (CUDA / TRT absent)
@@ -172,7 +196,8 @@ class PipelineManager:
             time.sleep(10)       # let it run; stop() called on __exit__
     """
 
-    def __init__(self, config: Optional[PipelineConfig] = None, pose_provider=None):
+    def __init__(self, config: Optional[PipelineConfig] = None, pose_provider=None,
+                 scale_reference=None):
         self._config = config or PipelineConfig()
         cfg = self._config
 
@@ -183,6 +208,14 @@ class PipelineManager:
         # across frames (an RGB-D sensor / TUM), which is exactly what the
         # OdometryPoseProvider in src/slam expects.
         self._pose_provider = pose_provider
+
+        # Optional per-frame metric-scale anchor for the monocular path. A
+        # callable (frame_bgr, rel_depth) -> (pred_values, ref_depth[, weights])
+        # or None. Feeds the DepthScaleAligner so relative depth becomes metric
+        # before pose/TSDF/Gaussians consume it. Only used when
+        # config.metric_scale_enabled; see _apply_metric_scale.
+        self._scale_reference = scale_reference
+        self._aligner = None            # built in start() when enabled
 
         self._stop_event = threading.Event()
         self._started = False
@@ -275,6 +308,26 @@ class PipelineManager:
                 W=self._config.depth_input_w,
             )
 
+    def _init_aligner(self):
+        """Build the DepthScaleAligner if metric scale is enabled, else None."""
+        cfg = self._config
+        if not cfg.metric_scale_enabled:
+            return None
+        from depth.metric_scale import DepthScaleAligner
+        aligner = DepthScaleAligner(
+            space=cfg.metric_scale_space,
+            robust=cfg.metric_scale_robust,
+            smoothing=cfg.metric_scale_smoothing,
+            min_points=cfg.metric_scale_min_points,
+            clamp=cfg.metric_scale_clamp,
+        )
+        if self._scale_reference is None:
+            logger.warning(
+                "metric_scale_enabled but no scale_reference provider — depth "
+                "will pass through un-scaled (aligner runs as identity).")
+        logger.info("Metric-scale aligner active (space=%s)", cfg.metric_scale_space)
+        return aligner
+
     def _init_usd_bridge(self) -> None:
         """Create the in-memory USD stage. No-op if pxr is not installed."""
         try:
@@ -315,6 +368,9 @@ class PipelineManager:
 
         # ---- Depth estimator ----
         self._depth_estimator = self._init_depth_estimator()
+
+        # ---- Metric-scale aligner (relative → metric depth) ----
+        self._aligner = self._init_aligner()
 
         # ---- TSDF collision proxy ----
         from mapping.collision_proxy import (
@@ -422,13 +478,17 @@ class PipelineManager:
         """
         samples = list(self._depth_ms)   # copy; deque may mutate mid-read
         depth_ms = sum(samples) / len(samples) if samples else 0.0
-        return {
+        stats = {
             "frames": self.frames_processed,
             "exports": self.usd_exports,
             "gaussians": len(self._gaussian_positions),
             "depth_ms": depth_ms,
             "depth_backend": self.depth_backend,
         }
+        if self._aligner is not None and self._aligner.params is not None:
+            # Current metric scale in effect (None until the first good fit).
+            stats["metric_scale"] = self._aligner.params.scale
+        return stats
 
     def latest_occupancy(self) -> Optional[np.ndarray]:
         """Most recent top-down occupancy grid, or None. For live visualization."""
@@ -469,6 +529,10 @@ class PipelineManager:
                 continue
 
             self.frames_processed += 1
+
+            # --- Metric scale (relative → metric depth, before any consumer) ---
+            if self._aligner is not None:
+                depth = self._apply_metric_scale(frame, depth)
 
             # --- Pose estimation (M6; None → identity, fixed-camera fusion) ---
             pose = None
@@ -514,6 +578,29 @@ class PipelineManager:
             logger.exception("Coordinator thread crashed")
             self._thread_errors["coordinator"] = exc
             self._stop_event.set()
+
+    def _apply_metric_scale(self, frame: np.ndarray, depth: np.ndarray) -> np.ndarray:
+        """Fit the aligner on this frame's reference (if any) and rescale depth.
+
+        Best-effort: a failing or empty reference provider never crashes the
+        loop — the aligner simply coasts on its current (scale, shift) and still
+        returns a metric map. Before the first successful fit it is the identity,
+        so the pipeline runs from frame 0 (just not yet metric).
+        """
+        if self._scale_reference is not None:
+            try:
+                ref = self._scale_reference(frame, depth)
+            except Exception:
+                logger.exception("scale_reference failed on frame %d",
+                                 self.frames_processed)
+                ref = None
+            if ref is not None:
+                try:
+                    self._aligner.fit(*ref)
+                except Exception:
+                    logger.exception("scale fit failed on frame %d",
+                                     self.frames_processed)
+        return self._aligner.transform(depth)
 
     def _backproject_gaussians(self, depth: np.ndarray,
                                pose: Optional[np.ndarray] = None) -> None:
