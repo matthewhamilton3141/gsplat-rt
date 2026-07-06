@@ -124,13 +124,38 @@ def to_fp16(src_path: str = DEFAULT_ONNX_PATH,
 
     print(f"[fp16] Loading {src_path}")
     model = onnx.load(src_path)
-    model16 = float16.convert_float_to_float16(model, keep_io_types=keep_io_types)
+    # op_block_list=[] converts EVERY float op (incl. Resize, which the DPT head
+    # uses and which the converter's default block-list would otherwise keep in
+    # fp32 — an fp32 island a strongly-typed network can't reconcile).
+    block = None if keep_io_types else []
+    model16 = float16.convert_float_to_float16(
+        model, keep_io_types=keep_io_types, op_block_list=block)
+
+    if not keep_io_types:
+        # onnxconverter_common converts every *weight* to fp16 but (in this
+        # version) leaves the graph inputs/outputs declared float32 and inserts
+        # no boundary cast — so the first conv gets an fp32 activation into an
+        # fp16 kernel, which a strongly-typed TensorRT network rejects. Force the
+        # I/O tensor types to fp16 ourselves so the graph is genuinely uniform.
+        _force_io_fp16(model16)
+
     onnx.checker.check_model(model16)
     onnx.save(model16, dst_path)
 
     io = "fp32 I/O + fp16 internals" if keep_io_types else "uniformly fp16 (I/O + weights)"
     size_mb = os.path.getsize(dst_path) / 1e6
     print(f"[fp16] OK — {dst_path}  ({size_mb:.1f} MB)  ({io})")
+
+
+def _force_io_fp16(model) -> None:
+    """Set every graph input/output tensor's element type to FLOAT16 in place."""
+    fp32 = onnx.TensorProto.FLOAT
+    fp16 = onnx.TensorProto.FLOAT16
+    for vi in list(model.graph.input) + list(model.graph.output):
+        tt = vi.type.tensor_type
+        if tt.elem_type == fp32:
+            tt.elem_type = fp16
+            print(f"[fp16]   forced I/O tensor '{vi.name}' float32 → float16")
 
 
 if __name__ == "__main__":
