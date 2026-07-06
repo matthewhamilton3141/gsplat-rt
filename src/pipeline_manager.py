@@ -119,6 +119,10 @@ class PipelineConfig:
     finalize_max_points: int = 2000
     """Cap on Gaussians seeded from the accumulated cloud during finalize."""
 
+    finalize_ssim_weight: float = 0.2
+    """λ for the finalize photometric loss ``(1−λ)·L1 + λ·(1−SSIM)`` (Kerbl et al.
+    use 0.2). 0 → pure L1 (the original behaviour)."""
+
     # ---- Monocular metric scale (relative → metric depth) ----
     metric_scale_enabled: bool = False
     """Insert the scale/shift aligner between depth inference and the
@@ -728,6 +732,7 @@ class PipelineManager:
             points, views,
             max_points=self._config.finalize_max_points,
             iters=self._config.finalize_iters,
+            ssim_weight=self._config.finalize_ssim_weight,
         )
         self.optimized_gaussians = model
         self.finalize_result = result

@@ -53,6 +53,7 @@ def finalize_gaussians(
     init_scale: float = 0.05,
     init_opacity: float = 0.1,
     seed: int = 0,
+    ssim_weight: float = 0.0,
 ) -> Tuple[GaussianModel, FitResult]:
     """Seed Gaussians at ``points`` and optimise them to reproduce ``views``.
 
@@ -66,7 +67,7 @@ def finalize_gaussians(
         pts = pts[sel]
     model = GaussianModel.from_points(pts, init_scale=init_scale,
                                       init_opacity=init_opacity)
-    result = fit(model, views, iters=iters, lr=lr)
+    result = fit(model, views, iters=iters, lr=lr, ssim_weight=ssim_weight)
     return model, result
 
 

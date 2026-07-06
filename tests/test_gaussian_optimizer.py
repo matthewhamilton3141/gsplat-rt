@@ -61,6 +61,30 @@ def test_overfit_multiview_improves_psnr():
     assert end_psnr > 28.0, end_psnr
 
 
+def test_ssim_weighted_fit_improves_structural_similarity():
+    """The 3DGS loss ((1−λ)L1 + λ(1−SSIM)) must train — loss drops, and both PSNR
+    and SSIM to the targets improve."""
+    from gaussian.ssim import ssim
+
+    rng = np.random.default_rng(11)
+    truth = _truth()
+    views = _views(truth)
+
+    init = _truth()
+    init.means += rng.normal(0, 0.03, init.means.shape)
+    init.colors += rng.normal(0, 0.5, init.colors.shape)
+    init.opacities += rng.normal(0, 0.3, init.opacities.shape)
+    init.log_scales += rng.normal(0, 0.15, init.log_scales.shape)
+
+    start_ssim = np.mean([ssim(rasterize(init, c)[0], t) for c, t in views])
+    res = fit(init, views, iters=250, lr=LearningRates(), ssim_weight=0.2)
+    end_ssim = np.mean([ssim(rasterize(init, c)[0], t) for c, t in views])
+
+    assert res.losses[-1] < res.losses[0] * 0.6, (res.losses[0], res.losses[-1])
+    assert res.psnrs[-1] > 25.0, res.psnrs[-1]
+    assert end_ssim > start_ssim + 0.05, (start_ssim, end_ssim)
+
+
 if __name__ == "__main__":
     import time
     t = time.time()

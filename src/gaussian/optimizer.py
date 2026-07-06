@@ -5,8 +5,10 @@ from ``rasterizer.rasterize_backward``. This is the CPU reference optimiser —
 correctness and the training loop shape first; the CUDA/torch port to the A10G
 reuses the exact same loss and update rule.
 
-Loss is L1 photometric error (as in Kerbl et al. 2023, minus the D-SSIM term,
-which needs a windowed SSIM not yet implemented). PSNR is reported for tests.
+Loss is the 3DGS photometric loss (Kerbl et al. 2023):
+``(1 − λ)·L1 + λ·(1 − SSIM)`` with ``λ = ssim_weight`` (0 → pure L1, the original
+behaviour). The windowed SSIM + analytic D-SSIM gradient live in ``ssim.py``.
+PSNR is reported for tests.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import numpy as np
 
 from .gaussian_model import GaussianModel
 from .rasterizer import Camera, rasterize, rasterize_backward
+from .ssim import dssim_loss_and_grad
 
 _FIELDS = ("means", "log_scales", "quats", "opacities", "colors")
 
@@ -75,6 +78,18 @@ def _l1_loss_and_grad(img: np.ndarray, target: np.ndarray):
     return loss, grad_img
 
 
+def _photometric_loss_and_grad(img: np.ndarray, target: np.ndarray,
+                               ssim_weight: float):
+    """3DGS loss ``(1−λ)·L1 + λ·(1−SSIM)`` and its gradient w.r.t. the image."""
+    l1, g_l1 = _l1_loss_and_grad(img, target)
+    if ssim_weight <= 0.0:
+        return l1, g_l1
+    ds, g_ds = dssim_loss_and_grad(img, target)
+    loss = (1.0 - ssim_weight) * l1 + ssim_weight * ds
+    grad = (1.0 - ssim_weight) * g_l1 + ssim_weight * g_ds
+    return loss, grad
+
+
 @dataclass
 class FitResult:
     losses: List[float]
@@ -87,10 +102,13 @@ def fit(
     iters: int = 200,
     lr: LearningRates | None = None,
     log_every: int = 0,
+    ssim_weight: float = 0.0,
 ) -> FitResult:
     """Optimise ``model`` in place to reproduce ``views`` = [(camera, image)].
 
-    Returns per-iteration L1 loss and mean PSNR across the views.
+    ``ssim_weight`` (λ) blends the D-SSIM term into the photometric loss; 0 keeps
+    the original pure-L1 behaviour, 0.2 matches the 3DGS paper. Returns the
+    per-iteration photometric loss and mean PSNR across the views.
     """
     opt = _AdamState(lr or LearningRates())
     losses: List[float] = []
@@ -102,7 +120,7 @@ def fit(
         psnr_sum = 0.0
         for cam, target in views:
             img, cache = rasterize(model, cam)
-            loss, grad_img = _l1_loss_and_grad(img, target)
+            loss, grad_img = _photometric_loss_and_grad(img, target, ssim_weight)
             grads = rasterize_backward(grad_img, cache)
             for f in _FIELDS:
                 grad_acc[f] += grads[f]
