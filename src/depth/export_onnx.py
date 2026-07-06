@@ -98,14 +98,23 @@ def export(onnx_path: str = DEFAULT_ONNX_PATH) -> None:
 
 def to_fp16(src_path: str = DEFAULT_ONNX_PATH,
             dst_path: str = FP16_ONNX_PATH,
-            keep_io_types: bool = True) -> None:
+            keep_io_types: bool = False) -> None:
     """Convert the fp32 ONNX to fp16 for a strongly-typed TensorRT FP16 build.
 
-    ``keep_io_types=True`` inserts fp32↔fp16 cast nodes at the graph boundary so
-    the engine's input/output bindings stay float32 — ``DepthEstimator``'s
-    pre-allocated fp32 buffers keep working unchanged — while every internal
-    conv/GEMM runs in half precision. Precision-sensitive ops (the library's
-    default block list) are left in fp32 to protect accuracy.
+    A **strongly-typed** network (TRT 10+/11, the only route to true FP16 now
+    that the weakly-typed ``BuilderFlag.FP16`` is gone) inserts *no* automatic
+    casts — it honours the ONNX dtypes exactly. So the graph must be internally
+    type-consistent: ``keep_io_types=False`` produces a **uniformly fp16** graph
+    (fp16 I/O + fp16 weights), which strongly-typed parses cleanly.
+
+    (``keep_io_types=True`` keeps fp32 I/O with fp16 weights and relies on the
+    runtime to reconcile them — fine under weakly-typed TRT, but under
+    strongly-typed the first conv sees an fp32 activation into fp16 weights and
+    the parse fails. Hence the fp16 default here.)
+
+    Because the engine's I/O bindings are now fp16, ``DepthEstimator`` reads each
+    binding's dtype and sizes its buffers to match (it casts host input to fp16
+    and the output back to fp32), so it runs either engine transparently.
     """
     from onnxconverter_common import float16
 
@@ -119,9 +128,9 @@ def to_fp16(src_path: str = DEFAULT_ONNX_PATH,
     onnx.checker.check_model(model16)
     onnx.save(model16, dst_path)
 
+    io = "fp32 I/O + fp16 internals" if keep_io_types else "uniformly fp16 (I/O + weights)"
     size_mb = os.path.getsize(dst_path) / 1e6
-    print(f"[fp16] OK — {dst_path}  ({size_mb:.1f} MB)  "
-          f"(I/O kept float32; internals fp16)")
+    print(f"[fp16] OK — {dst_path}  ({size_mb:.1f} MB)  ({io})")
 
 
 if __name__ == "__main__":

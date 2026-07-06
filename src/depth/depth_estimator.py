@@ -75,22 +75,34 @@ class DepthEstimator:
         # Private CUDA stream: inference doesn't block other GPU work
         self._stream = torch.cuda.Stream()
 
+        self._input_name = "pixel_values"
+        self._output_name = "depth"
+
+        # Buffer dtype MUST match the engine's I/O binding dtype, or TRT reads/
+        # writes the wrong number of bytes. The TF32 engine binds float32; the
+        # strongly-typed FP16 engine binds float16 (its ONNX is uniformly fp16).
+        # We read the binding dtypes and size the buffers to match, so one
+        # DepthEstimator runs either engine — casting host input to the input
+        # dtype and the output back to float32 for callers.
+        def _torch_dtype(name: str):
+            dt = self._engine.get_tensor_dtype(name)
+            return torch.float16 if dt == trt.DataType.HALF else torch.float32
+
+        self._in_dtype = _torch_dtype(self._input_name)
+        self._out_dtype = _torch_dtype(self._output_name)
+
         # Pre-allocate device tensors — reused every call (no malloc on hot path).
-        # Dtype MUST match the engine's I/O binding types. The FP16 builder flag
-        # only enables reduced precision for internal layers; the network's input
-        # and output bindings keep the ONNX-declared float32, so these buffers are
-        # float32. Binding fp16 buffers here would size them at half the bytes TRT
-        # reads/writes → out-of-bounds access.
         self._dev_input = torch.empty(
-            (1, 3, INPUT_H, INPUT_W), dtype=torch.float32, device="cuda"
+            (1, 3, INPUT_H, INPUT_W), dtype=self._in_dtype, device="cuda"
         )
         self._dev_output = torch.empty(
-            (1, 1, INPUT_H, INPUT_W), dtype=torch.float32, device="cuda"
+            (1, 1, INPUT_H, INPUT_W), dtype=self._out_dtype, device="cuda"
         )
 
-        # Pinned host buffer for fast DMA H2D copy
+        # Pinned host buffer for fast DMA H2D copy (matches the input binding
+        # dtype; copy_ from the fp32 preprocessed tensor casts as needed).
         self._host_input = torch.empty(
-            (1, 3, INPUT_H, INPUT_W), dtype=torch.float32
+            (1, 3, INPUT_H, INPUT_W), dtype=self._in_dtype
         ).pin_memory()
 
         # ImageNet stats pinned on GPU — no CPU↔GPU transfer for normalization
@@ -98,8 +110,6 @@ class DepthEstimator:
         self._std_gpu = _STD.cuda()
 
         # Bind I/O tensor addresses once; TRT reuses them every execute call
-        self._input_name = "pixel_values"
-        self._output_name = "depth"
         self._context.set_tensor_address(self._input_name, self._dev_input.data_ptr())
         self._context.set_tensor_address(self._output_name, self._dev_output.data_ptr())
 
@@ -135,8 +145,10 @@ class DepthEstimator:
             if not ok:
                 raise RuntimeError("TensorRT execute_async_v3 returned False")
 
-            # D2H: bring result back on the same stream to preserve ordering
-            result_cpu = self._dev_output.squeeze().cpu()
+            # D2H: bring result back on the same stream to preserve ordering.
+            # Cast to float32 on-device so callers always get an fp32 depth map,
+            # whether the engine's output binding is fp16 (FP16 engine) or fp32.
+            result_cpu = self._dev_output.squeeze().float().cpu()
 
         self._stream.synchronize()
         return result_cpu.numpy()   # (518, 518) float32
