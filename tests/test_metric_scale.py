@@ -15,9 +15,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from depth.metric_scale import (  # noqa: E402
     DepthScaleAligner,
+    ScalePropagator,
     ScaleShift,
     align_scale_shift,
     align_scale_shift_robust,
+    estimate_relative_scale,
     sample_dense_reference,
     triangulate_two_view,
     triangulated_scale_reference,
@@ -382,6 +384,106 @@ def test_triangulated_reference_none_when_all_behind():
     uv_b = _project(K, R, t, X)
     assert triangulated_scale_reference(uv_a, uv_b, np.zeros((480, 640)),
                                         K, R, t) is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-frame scale propagation
+# ---------------------------------------------------------------------------
+
+def test_estimate_relative_scale_median_ratio():
+    numer = np.array([2.0, 4.0, 6.0, 8.0])
+    denom = np.array([1.0, 2.0, 3.0, 4.0])
+    assert estimate_relative_scale(numer, denom) == pytest.approx(2.0)
+
+
+def test_estimate_relative_scale_rejects_outliers():
+    rng = np.random.default_rng(20)
+    denom = rng.uniform(1.0, 5.0, size=200)
+    numer = 3.0 * denom
+    numer[:20] *= 10.0                         # 10% gross outliers
+    assert estimate_relative_scale(numer, denom) == pytest.approx(3.0, rel=1e-6)
+
+
+def test_estimate_relative_scale_none_when_empty():
+    assert estimate_relative_scale(np.array([-1.0]), np.array([-1.0])) is None
+
+
+def test_propagator_first_pair_defines_gauge_from_anchor():
+    prop = ScalePropagator(anchor=1.0, min_shared=6)
+    b = prop.update(np.array([]), np.array([]))    # no shared history
+    assert b == 1.0
+    assert prop.initialised
+
+
+def test_propagator_first_pair_honours_metric_anchor():
+    prop = ScalePropagator(anchor=0.42, min_shared=6)
+    assert prop.update(np.array([]), np.array([])) == 0.42
+
+
+def test_propagator_recovers_baseline_from_shared_landmarks():
+    prop = ScalePropagator(anchor=1.0, min_shared=4)
+    prop.update(np.array([]), np.array([]))        # init gauge
+    # Shared landmarks: global depth = 2.5 x local depth → baseline 2.5.
+    local = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    glob = 2.5 * local
+    b = prop.update(glob, local)
+    assert b == pytest.approx(2.5, rel=1e-9)
+    assert prop.n_updates == 1
+
+
+def test_propagator_coasts_on_too_few_shared():
+    prop = ScalePropagator(anchor=1.0, min_shared=6)
+    prop.update(np.array([]), np.array([]))
+    prop.update(3.0 * np.arange(1.0, 8.0), np.arange(1.0, 8.0))   # baseline 3
+    before = prop.baseline
+    b = prop.update(np.array([9.0]), np.array([1.0]))             # only 1 shared
+    assert b == before
+    assert prop.n_coasts == 1
+
+
+def test_propagator_chains_varying_baselines_to_global_consistency():
+    """The whole point: with per-pair baselines that vary, propagated depths stay
+    globally consistent (a single scale vs ground truth), where naive per-pair
+    unit-gauge depths would not."""
+    rng = np.random.default_rng(21)
+    # Ground-truth metric depths of shared landmarks at each frame.
+    z1 = rng.uniform(2.0, 6.0, 40)
+    z2 = rng.uniform(2.0, 6.0, 40)
+    z3 = rng.uniform(2.0, 6.0, 40)
+    b12, b23, b34 = 0.5, 1.7, 0.9            # true per-pair baselines (varying)
+
+    prop = ScalePropagator(anchor=1.0, min_shared=6)
+    # Pair (1,2): unit-gauge local depth at frame 1 = z1 / b12 (depth ∝ baseline).
+    prop.update(np.array([]), np.array([]))               # gauge = anchor 1.0
+    g2 = prop.baseline * (z2 / b12)                        # global depth at frame 2
+    # Pair (2,3): shared = frame-2 landmarks. local-at-2 in pair(2,3) gauge = z2/b23.
+    prop.update(g2, z2 / b23)
+    g3 = prop.baseline * (z3 / b23)
+    # Pair (3,4): shared = frame-3 landmarks. local-at-3 = z3/b34.
+    prop.update(g3, z3 / b34)
+    g3_from_pair34 = prop.baseline * (z3 / b34)
+
+    # Frame-3 global depth is identical whether reached via pair(2,3) or pair(3,4)
+    # → scale is globally consistent, not drifting with the baseline changes.
+    assert np.allclose(g3, g3_from_pair34, rtol=1e-9)
+    # And every frame's global depth is the true depth times ONE constant (1/b12).
+    for g, z in ((g2, z2), (g3, z3)):
+        ratio = g / z
+        assert np.allclose(ratio, ratio[0], rtol=1e-9)
+        assert ratio[0] == pytest.approx(1.0 / b12, rel=1e-9)
+
+
+def test_propagator_reset():
+    prop = ScalePropagator()
+    prop.update(np.array([]), np.array([]))
+    prop.reset()
+    assert not prop.initialised
+    assert prop.n_updates == 0
+
+
+def test_propagator_rejects_nonpositive_anchor():
+    with pytest.raises(ValueError):
+        ScalePropagator(anchor=0.0)
 
 
 # ---------------------------------------------------------------------------

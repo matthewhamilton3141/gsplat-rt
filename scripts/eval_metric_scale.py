@@ -27,7 +27,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from depth.metric_scale import DepthScaleAligner, sample_dense_reference  # noqa: E402
+from depth.metric_scale import (  # noqa: E402
+    DepthScaleAligner,
+    ScalePropagator,
+    sample_dense_reference,
+)
 
 
 def depth_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
@@ -67,6 +71,44 @@ def run_synthetic(seed: int = 0, h: int = 240, w: int = 320) -> None:
     print(_fmt("scale-aligned", depth_metrics(metric, z_true)))
     print(f"\nrecovered scale/shift: s={aligner.params.scale:.4f} "
           f"t={aligner.params.shift:.4f}  (fit RMS resid={aligner.last_residual:.2e})")
+
+
+def run_propagation(seed: int = 0, n_frames: int = 30) -> None:
+    """Simulate a monocular trajectory with varying per-frame baselines and show
+    that cross-frame propagation removes scale drift.
+
+    Each pair's unit-gauge depth = true_depth / baseline. WITHOUT propagation the
+    recovered scale tracks 1/baseline (drifts as the camera speeds up / slows
+    down); WITH propagation it holds the global gauge fixed. We report the scale
+    each frame relative to frame 1 — a flat line means no drift.
+    """
+    rng = np.random.default_rng(seed)
+    z_true = rng.uniform(2.0, 6.0, size=(n_frames, 40))     # shared landmarks
+    baselines = rng.uniform(0.3, 1.8, size=n_frames)        # varying camera speed
+
+    prop = ScalePropagator(anchor=1.0, min_shared=6)
+    prop.update(np.array([]), np.array([]))                 # frame 1 defines gauge
+    g_prev = prop.baseline * (z_true[0] / baselines[0])
+    ref_const = float(np.mean(g_prev / z_true[0]))          # global scale (1/b0)
+
+    print(f"{'frame':>5} {'baseline':>9} {'naive scale':>12} {'propagated':>12}")
+    naive_err, prop_err = [], []
+    for k in range(1, n_frames):
+        local_k = z_true[k] / baselines[k]                  # this pair's unit gauge
+        # Naive: trust each pair's own unit gauge → effective global scale 1/bₖ.
+        naive_scale = 1.0 / baselines[k]
+        prop.update(g_prev, z_true[k - 1] / baselines[k])   # shared = prev-frame landmarks
+        g_k = prop.baseline * local_k
+        prop_scale = float(np.mean(g_k / z_true[k]))
+        g_prev = g_k
+        if k < 11:
+            print(f"{k:5d} {baselines[k]:9.3f} {naive_scale:12.4f} {prop_scale:12.4f}")
+        naive_err.append(abs(naive_scale - ref_const) / ref_const)
+        prop_err.append(abs(prop_scale - ref_const) / ref_const)
+
+    print(f"\nglobal gauge (frame-1 scale)  : {ref_const:.4f}")
+    print(f"mean scale drift  naive       : {np.mean(naive_err) * 100:6.2f}%")
+    print(f"mean scale drift  propagated  : {np.mean(prop_err) * 100:6.2f}%")
 
 
 def run_tum(seq_dir: str, engine: str, space: str, max_frames: int) -> None:
@@ -112,11 +154,16 @@ def main():
     ap.add_argument("--space", default="disparity", choices=["disparity", "depth"])
     ap.add_argument("--max-frames", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--propagation", action="store_true",
+                    help="demo cross-frame scale propagation (drift vs no-drift)")
     args = ap.parse_args()
 
     if args.tum:
         print(f"TUM metric-scale eval — {args.tum}\n")
         run_tum(args.tum, args.engine, args.space, args.max_frames)
+    elif args.propagation:
+        print("Cross-frame scale-propagation demo (varying baselines)\n")
+        run_propagation(args.seed)
     else:
         print("Synthetic metric-scale eval (affine-invariant disparity)\n")
         run_synthetic(args.seed)

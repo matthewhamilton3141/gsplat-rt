@@ -455,6 +455,116 @@ def triangulated_scale_reference(
 
 
 # ---------------------------------------------------------------------------
+# Cross-frame scale propagation (globally-consistent monocular scale)
+# ---------------------------------------------------------------------------
+
+def estimate_relative_scale(
+    numer: np.ndarray,
+    denom: np.ndarray,
+    robust: bool = True,
+    reject_sigma: float = 3.0,
+) -> Optional[float]:
+    """Robust ``median(numer / denom)`` over paired positive samples.
+
+    The workhorse of scale propagation: ``numer`` are a shared landmark's depths
+    in the running global gauge, ``denom`` the same landmark's depths in the new
+    pair's unit gauge, so their ratio is the baseline that maps new depths into
+    the global gauge. Uses a median (breakdown 50%) and one MAD-based outlier
+    rejection pass. Returns None if nothing valid remains.
+    """
+    numer = np.asarray(numer, dtype=np.float64).ravel()
+    denom = np.asarray(denom, dtype=np.float64).ravel()
+    m = np.isfinite(numer) & np.isfinite(denom) & (numer > _EPS) & (denom > _EPS)
+    if not np.any(m):
+        return None
+    r = numer[m] / denom[m]
+    if not robust or r.size < 3:
+        return float(np.median(r))
+    med = np.median(r)
+    mad = np.median(np.abs(r - med))
+    if mad > _EPS:
+        keep = np.abs(r - med) <= reject_sigma * 1.4826 * mad
+        if np.any(keep):
+            r = r[keep]
+    return float(np.median(r))
+
+
+class ScalePropagator:
+    """Chains per-pair unit-gauge baselines into one globally-consistent scale.
+
+    Monocular two-view geometry gives each frame pair a relative pose with a
+    *unit* translation, so each pair's triangulated depths live in their own
+    baseline gauge — this is the source of monocular scale drift. Given the
+    depths of landmarks shared with the previous pair (already in the global
+    gauge), this recovers the factor ``baseline`` that maps the new pair's
+    unit-gauge depths into the same global gauge:
+
+        baseline = median( shared_prev_global_depth / shared_new_local_depth )
+        metric_depth = baseline · local_depth
+
+    The first pair has no shared history, so it defines the gauge from ``anchor``
+    (1.0 → consistent-but-arbitrary absolute scale, the honest monocular limit;
+    set it to a known metric baseline to pin true metres). When too few
+    landmarks are shared (fast motion, a cut) it *coasts* on the last baseline
+    rather than snapping the scale.
+    """
+
+    def __init__(self, anchor: float = 1.0, min_shared: int = 6):
+        if anchor <= 0.0:
+            raise ValueError("anchor must be positive")
+        self.anchor = anchor
+        self.min_shared = min_shared
+        self.baseline: Optional[float] = None   # None until the first pair
+        self.n_updates: int = 0
+        self.n_coasts: int = 0
+
+    @property
+    def initialised(self) -> bool:
+        return self.baseline is not None
+
+    def reset(self) -> None:
+        self.baseline = None
+        self.n_updates = 0
+        self.n_coasts = 0
+
+    def update(self, prev_global: np.ndarray, new_local: np.ndarray) -> float:
+        """Fold one pair's shared landmarks into the running baseline.
+
+        Args:
+            prev_global: (M,) depths of the shared landmarks in the global gauge
+                         (from the previous pair).
+            new_local:   (M,) the same landmarks' depths in this pair's unit gauge.
+
+        Returns:
+            The baseline now in effect (``metric = baseline · local``).
+        """
+        prev_global = np.asarray(prev_global, dtype=np.float64).ravel()
+        new_local = np.asarray(new_local, dtype=np.float64).ravel()
+        valid = (np.isfinite(prev_global) & np.isfinite(new_local)
+                 & (prev_global > _EPS) & (new_local > _EPS))
+        n = int(valid.sum())
+
+        if n < self.min_shared:
+            if self.baseline is None:
+                self.baseline = self.anchor          # first pair: define the gauge
+            else:
+                self.n_coasts += 1                    # dropout: hold last scale
+            return self.baseline
+
+        b = estimate_relative_scale(prev_global[valid], new_local[valid])
+        if b is None or not np.isfinite(b) or b <= 0.0:
+            if self.baseline is None:
+                self.baseline = self.anchor
+            else:
+                self.n_coasts += 1
+            return self.baseline
+
+        self.baseline = b
+        self.n_updates += 1
+        return self.baseline
+
+
+# ---------------------------------------------------------------------------
 # Dense-reference convenience (RGB-D / TUM validation path)
 # ---------------------------------------------------------------------------
 

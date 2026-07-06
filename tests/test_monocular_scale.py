@@ -16,8 +16,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 cv2 = pytest.importorskip("cv2")
 
-from slam.monocular_scale import estimate_relative_pose  # noqa: E402
+from slam.monocular_scale import (  # noqa: E402
+    MonocularScaleReference,
+    estimate_relative_pose,
+)
 from depth.metric_scale import triangulate_two_view      # noqa: E402
+
+try:
+    from mapping.collision_proxy import CameraIntrinsics
+except ImportError:
+    from src.mapping.collision_proxy import CameraIntrinsics
 
 
 def _K():
@@ -84,3 +92,61 @@ def test_estimate_relative_pose_rejects_too_few_points():
     K = _K()
     pts = np.random.default_rng(2).uniform(0, 640, size=(4, 2))
     assert estimate_relative_pose(pts, pts, K) is None
+
+
+def _proj_cam(K, Xcam):
+    uvw = (K @ Xcam.T).T
+    return uvw[:, :2] / uvw[:, 2:3]
+
+
+def test_monocular_reference_global_scale_consistency():
+    """Cross-frame propagation: a camera moving with VARYING per-step baselines
+    still yields depths that are the true depth times ONE global constant at
+    every frame — i.e. no scale drift. The _geometry_step core is driven with
+    synthetic correspondences (identity indices link landmarks across frames)."""
+    rng = np.random.default_rng(40)
+    K = _K()                                            # fx=fy=600, c=(320,240)
+    intr = CameraIntrinsics(fx=600.0, fy=600.0, cx=320.0, cy=240.0,
+                            width=640, height=480)
+    ref = MonocularScaleReference(intr, min_matches=6, min_shared=6, anchor=1.0)
+
+    n = 90
+    Xw = np.column_stack([rng.uniform(-3, 3, n), rng.uniform(-2, 2, n),
+                          rng.uniform(4, 10, n)])       # world points, R=I cameras
+    # Camera centres with DIFFERENT step sizes each pair (varying baseline).
+    centres = [np.array([0.0, 0.0, 0.0]),
+               np.array([0.5, 0.0, 0.2]),               # baseline 0.539
+               np.array([1.7, 0.0, -0.1]),              # baseline 1.237
+               np.array([2.0, 0.0, 0.3])]               # baseline 0.500
+    ids = np.arange(n)
+    depth_map = np.ones((480, 640))
+
+    baseline_01 = float(np.linalg.norm(centres[1] - centres[0]))
+    expected_const = 1.0 / baseline_01                  # global gauge from anchor=1
+
+    for i in range(len(centres) - 1):
+        Xa = Xw - centres[i]                            # cam-A coords (R=I)
+        Xb = Xw - centres[i + 1]
+        uv_a = _proj_cam(K, Xa)
+        uv_b = _proj_cam(K, Xb)
+        out = ref._geometry_step(uv_a, uv_b, ids, ids, depth_map)
+        assert out is not None
+        _, metric_cur = out
+        assert len(metric_cur) == n                     # clean data → all inliers
+        z_true_cur = Xb[:, 2]
+        ratio = metric_cur / z_true_cur
+        # Internally consistent across landmarks *and* equal to the global const
+        # every frame despite the baseline changing — that's the drift-free claim.
+        assert np.allclose(ratio, expected_const, rtol=1e-3), (
+            f"frame {i + 1}: ratio spread "
+            f"{ratio.min():.4f}..{ratio.max():.4f}, expected {expected_const:.4f}")
+
+    assert ref.baseline is not None
+
+
+def test_monocular_reference_first_frame_returns_none():
+    intr = CameraIntrinsics(fx=600.0, fy=600.0, cx=320.0, cy=240.0,
+                            width=640, height=480)
+    ref = MonocularScaleReference(intr)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    assert ref(frame, np.ones((480, 640), dtype=np.float32)) is None

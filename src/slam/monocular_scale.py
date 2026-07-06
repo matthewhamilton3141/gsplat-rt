@@ -10,21 +10,27 @@ pixel, which the :class:`DepthScaleAligner` uses to lock the dense map's scale.
 Scale gauge — read this before trusting the numbers
 ---------------------------------------------------
 ``cv2.recoverPose`` returns a **unit** translation, so a single frame-pair's
-triangulated depths are only defined up to that pair's baseline. Two honest ways
-to make them absolute:
+triangulated depths are only defined up to that pair's baseline — and the
+baseline changes every frame as the camera speeds up and slows down, which is
+exactly monocular scale drift. This class defeats the drift with **cross-frame
+scale propagation** (:class:`~depth.metric_scale.ScalePropagator`): landmarks
+shared with the previous pair are already in a running global gauge, so their
+depth ratio pins the new pair's baseline into that same gauge. The per-frame
+scale is therefore globally consistent, not just locally valid.
 
-- **Known baseline:** pass ``baseline_m`` = the real inter-frame camera
-  translation (from an IMU, wheel odometry, or a constant-velocity rig). Depths
-  come out in metres directly.
-- **Metric anchor frame:** leave ``baseline_m=1.0`` (unit gauge) and fix the one
-  global factor once from an external metric cue (an RGB-D calibration frame, a
-  known object size, camera-height + ground plane). The aligner's temporal EMA
-  then keeps subsequent frames consistent.
+That still leaves **one** free number — the absolute size of the whole
+reconstruction — which is genuinely unobservable from a single moving camera.
+Pin it either way:
 
-This module provides the machinery and the geometry; choosing the global gauge is
-a deployment decision, made explicit rather than hidden. The geometry core
-(:func:`estimate_relative_pose`) is separated from the ORB front-end so it can be
-unit-tested with synthetic correspondences.
+- **Known baseline:** pass ``anchor`` = the real first-pair camera translation
+  (metres, from an IMU / wheel odometry / a rig) → depths come out in metres.
+- **Arbitrary gauge:** leave ``anchor=1.0`` → a consistent but arbitrary absolute
+  scale; multiply by one external metric cue (RGB-D calibration frame, known
+  object size, camera height + ground plane) to make it metric.
+
+The geometry (:func:`estimate_relative_pose`) and the propagation
+(:meth:`MonocularScaleReference._geometry_step`) are separated from the ORB
+front-end so both can be unit-tested with synthetic correspondences.
 """
 
 from __future__ import annotations
@@ -36,10 +42,10 @@ import numpy as np
 
 try:
     from mapping.collision_proxy import CameraIntrinsics
-    from depth.metric_scale import triangulated_scale_reference
+    from depth.metric_scale import ScalePropagator, triangulate_two_view
 except ImportError:  # pragma: no cover - import-path shim
     from src.mapping.collision_proxy import CameraIntrinsics
-    from src.depth.metric_scale import triangulated_scale_reference
+    from src.depth.metric_scale import ScalePropagator, triangulate_two_view
 
 
 def _k_matrix(K: CameraIntrinsics) -> np.ndarray:
@@ -87,10 +93,12 @@ class MonocularScaleReference:
 
     Mirrors the ``scale_reference(frame_bgr, rel_depth) -> (pred_values,
     ref_depth)`` contract PipelineManager expects. Holds the previous frame's
-    ORB features; each call matches to the current frame, recovers the relative
-    pose, triangulates the inliers, and returns predicted-value / metric-depth
-    pairs. Returns None on the first frame and whenever geometry is degenerate —
-    the aligner then coasts on its current scale.
+    ORB features *and* the global-gauge depth of every landmark it triangulated;
+    each call matches to the current frame, recovers the relative pose,
+    triangulates the inliers, propagates scale through the landmarks shared with
+    the previous pair, and returns predicted-value / metric-depth pairs at the
+    current frame's pixels. Returns None on the first frame and whenever geometry
+    is degenerate — the aligner then coasts on its current scale.
 
     The RGB frame is resized to the depth map's resolution so pixels and
     intrinsics agree (same convention as OdometryPoseProvider).
@@ -102,16 +110,28 @@ class MonocularScaleReference:
         n_features: int = 1500,
         ratio: float = 0.75,
         min_matches: int = 12,
-        baseline_m: float = 1.0,
+        anchor: float = 1.0,
+        min_shared: int = 6,
     ):
         self.K = intrinsics
         self._Kmat = _k_matrix(intrinsics)
         self.ratio = ratio
         self.min_matches = min_matches
-        self.baseline_m = baseline_m
         self._orb = cv2.ORB_create(nfeatures=n_features)
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self._propagator = ScalePropagator(anchor=anchor, min_shared=min_shared)
+
         self._prev: Optional[Tuple[np.ndarray, np.ndarray]] = None  # (xy, des)
+        # Global-gauge depth of each previous-frame landmark, keyed by that
+        # frame's keypoint index. Rebuilt every step; the bridge between pairs.
+        self._landmarks: dict = {}
+
+    # -- observability -------------------------------------------------------
+
+    @property
+    def baseline(self) -> Optional[float]:
+        """Current propagated baseline (global gauge), or None before init."""
+        return self._propagator.baseline
 
     def _features(self, gray: np.ndarray):
         kp, des = self._orb.detectAndCompute(gray, None)
@@ -126,6 +146,69 @@ class MonocularScaleReference:
         good = [[m.queryIdx, m.trainIdx]
                 for m, n in knn if m.distance < self.ratio * n.distance]
         return np.array(good, dtype=np.int32) if good else np.empty((0, 2), np.int32)
+
+    def _geometry_step(
+        self,
+        uv_prev: np.ndarray,
+        uv_cur: np.ndarray,
+        prev_ids: np.ndarray,
+        cur_ids: np.ndarray,
+        rel_depth: np.ndarray,
+    ):
+        """Pose + triangulate + propagate for one matched pair (testable core).
+
+        ``uv_prev``/``uv_cur`` are matched pixels in the previous/current frame;
+        ``prev_ids``/``cur_ids`` are their keypoint indices in each frame (the
+        identity that links landmarks across pairs). Triangulates in the
+        *previous* frame (A) so a landmark's depth there can be compared with the
+        depth the previous pair stored for it; also carries each point forward to
+        the current frame (B) to build this frame's reference and next step's
+        landmark map. Returns ``(pred_values, metric_depth)`` at current-frame
+        pixels, or None if the step is degenerate (the landmark map is cleared so
+        a broken step can't create phantom correspondences).
+        """
+        pose = estimate_relative_pose(uv_prev, uv_cur, self._Kmat)
+        if pose is None:
+            self._landmarks = {}
+            return None
+        R, t_unit, inliers = pose
+        if int(inliers.sum()) < self.min_matches:
+            self._landmarks = {}
+            return None
+
+        uv_a = uv_prev[inliers]
+        uv_b = uv_cur[inliers]
+        pts_a, valid = triangulate_two_view(uv_a, uv_b, self._Kmat, R, t_unit)
+        if not np.any(valid):
+            self._landmarks = {}
+            return None
+
+        pts_a = pts_a[valid]
+        z_prev = pts_a[:, 2]                                  # unit-gauge depth at A
+        z_cur = (pts_a @ R.T + t_unit)[:, 2]                 # unit-gauge depth at B
+        ids_prev = np.asarray(prev_ids)[inliers][valid]
+        ids_cur = np.asarray(cur_ids)[inliers][valid]
+
+        # Landmarks shared with the previous pair fix the global baseline.
+        shared_prev_global, shared_new_local = [], []
+        for pid, zp in zip(ids_prev, z_prev):
+            g = self._landmarks.get(int(pid))
+            if g is not None:
+                shared_prev_global.append(g)
+                shared_new_local.append(zp)
+        baseline = self._propagator.update(
+            np.asarray(shared_prev_global), np.asarray(shared_new_local))
+
+        metric_cur = baseline * z_cur                        # global-gauge metres
+        # Carry landmarks forward, keyed by current-frame keypoint index.
+        self._landmarks = {int(cid): float(md)
+                           for cid, md in zip(ids_cur, metric_cur)}
+
+        h, w = rel_depth.shape[:2]
+        cols = np.clip(np.rint(uv_b[:, 0]).astype(int), 0, w - 1)
+        rows = np.clip(np.rint(uv_b[:, 1]).astype(int), 0, h - 1)
+        pred_values = np.asarray(rel_depth)[rows, cols]
+        return pred_values, metric_cur
 
     def __call__(self, frame_bgr: np.ndarray, rel_depth: np.ndarray):
         h, w = rel_depth.shape[:2]
@@ -142,23 +225,9 @@ class MonocularScaleReference:
         self._prev = (xy, des)
         matches = self._match(prev_des, des)
         if len(matches) < self.min_matches:
+            self._landmarks = {}
             return None
 
-        uv_a = prev_xy[matches[:, 0]]      # previous frame == triangulation frame A
-        uv_b = xy[matches[:, 1]]
-        pose = estimate_relative_pose(uv_a, uv_b, self._Kmat)
-        if pose is None:
-            return None
-        R, t_unit, inliers = pose
-        if int(inliers.sum()) < self.min_matches:
-            return None
-
-        # Triangulate against the *previous* frame — but the aligner is fitting
-        # THIS frame's rel_depth. We instead triangulate in the current frame's
-        # coordinates by swapping the roles (B is the current frame): use the
-        # inverse relative pose so depths land at current-frame pixels.
-        R_ba = R.T
-        t_ba = -R.T @ (self.baseline_m * t_unit)
-        ref = triangulated_scale_reference(
-            uv_b[inliers], uv_a[inliers], rel_depth, self._Kmat, R_ba, t_ba)
-        return ref
+        return self._geometry_step(
+            prev_xy[matches[:, 0]], xy[matches[:, 1]],
+            matches[:, 0], matches[:, 1], rel_depth)
