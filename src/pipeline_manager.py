@@ -143,6 +143,19 @@ class PipelineConfig:
     metric_scale_clamp: tuple = (0.05, 100.0)
     """(min, max) metres clamp applied to aligned depth, or None to disable."""
 
+    metric_scale_monocular: bool = False
+    """Auto-build a MonocularScaleReference (two-view triangulation + cross-frame
+    scale propagation) from the camera intrinsics as the aligner's reference,
+    when no ``scale_reference`` is injected. This is what makes a *pure monocular*
+    stream produce metric depth end-to-end. Needs cv2; falls back to identity
+    (with a warning) if unavailable. Ignored when metric_scale_enabled is False
+    or an explicit scale_reference was passed to PipelineManager."""
+
+    metric_scale_anchor: float = 1.0
+    """Absolute-scale gauge for the monocular reference: a known first-pair camera
+    translation (metres) pins true metric scale; 1.0 gives a globally-consistent
+    but arbitrary absolute scale (the honest monocular limit)."""
+
 
 # ---------------------------------------------------------------------------
 # Mock depth estimator (CUDA / TRT absent)
@@ -321,12 +334,35 @@ class PipelineManager:
             min_points=cfg.metric_scale_min_points,
             clamp=cfg.metric_scale_clamp,
         )
-        if self._scale_reference is None:
-            logger.warning(
-                "metric_scale_enabled but no scale_reference provider — depth "
-                "will pass through un-scaled (aligner runs as identity).")
         logger.info("Metric-scale aligner active (space=%s)", cfg.metric_scale_space)
         return aligner
+
+    def _maybe_build_monocular_reference(self) -> None:
+        """Auto-wire a MonocularScaleReference when the monocular path is on.
+
+        Only when the aligner is enabled, no explicit scale_reference was
+        injected, and metric_scale_monocular is set. Requires cv2; on failure the
+        aligner falls back to identity (a warning), so the pipeline still runs.
+        """
+        cfg = self._config
+        if self._aligner is None or self._scale_reference is not None:
+            return
+        if not cfg.metric_scale_monocular:
+            logger.warning(
+                "metric_scale_enabled but no scale_reference and "
+                "metric_scale_monocular=False — depth passes through un-scaled "
+                "(aligner runs as identity).")
+            return
+        try:
+            from slam.monocular_scale import MonocularScaleReference
+            self._scale_reference = MonocularScaleReference(
+                self._camera_k, anchor=cfg.metric_scale_anchor)
+            logger.info("Monocular scale reference active (anchor=%.3f)",
+                        cfg.metric_scale_anchor)
+        except Exception:
+            logger.exception(
+                "Could not build MonocularScaleReference — aligner runs as "
+                "identity (depth stays relative).")
 
     def _init_usd_bridge(self) -> None:
         """Create the in-memory USD stage. No-op if pxr is not installed."""
@@ -384,6 +420,9 @@ class PipelineManager:
         )
         self._collision_extractor = CollisionProxyExtractor(tsdf=tsdf, update_hz=10.0)
         self._collision_extractor.start()
+
+        # ---- Monocular scale reference (needs intrinsics, so after _camera_k) ----
+        self._maybe_build_monocular_reference()
 
         # ---- USD bridge ----
         self._init_usd_bridge()

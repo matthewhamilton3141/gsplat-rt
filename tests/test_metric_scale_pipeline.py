@@ -127,8 +127,25 @@ def test_metric_scale_enabled_without_reference_is_identity():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = _base_cfg(tmp, metric_scale_enabled=True,
                         metric_scale_space="depth", metric_scale_clamp=None)
-    mgr, rec, _ = _run(cfg)                     # no scale_reference
+    mgr, rec, _ = _run(cfg)                     # no scale_reference, monocular off
     got = rec.latest()
     assert got is not None
     # No reference → aligner is identity in depth space → raw ~2 m bowl.
     assert 1.5 < float(np.median(got)) < 3.5
+
+
+def test_monocular_auto_wiring_builds_reference_and_runs():
+    # metric_scale_monocular=True + no injected reference → the pipeline builds a
+    # MonocularScaleReference from its intrinsics and runs the mono path end to
+    # end. (The synthetic clip has no real 3-D parallax, so the aligner mostly
+    # coasts; the point here is the wiring + that it runs without crashing.)
+    from slam.monocular_scale import MonocularScaleReference
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _base_cfg(tmp, metric_scale_enabled=True,
+                        metric_scale_monocular=True, metric_scale_space="depth")
+    mgr, rec, _ = _run(cfg)
+    assert isinstance(mgr._scale_reference, MonocularScaleReference)
+    assert mgr._aligner is not None
+    assert mgr.frames_processed > 0
+    assert rec.latest() is not None            # depth reached the consumers
