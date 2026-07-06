@@ -123,6 +123,12 @@ class PipelineConfig:
     """λ for the finalize photometric loss ``(1−λ)·L1 + λ·(1−SSIM)`` (Kerbl et al.
     use 0.2). 0 → pure L1 (the original behaviour)."""
 
+    finalize_densify: bool = False
+    """Run Adaptive Density Control during the finalize fit (clone/split under-/
+    over-reconstructed Gaussians, prune transparent ones). Off by default — the
+    seeded cloud is usually dense enough and densification lengthens the CPU fit;
+    enable for sparse seeds / higher-fidelity offline exports."""
+
     # ---- Monocular metric scale (relative → metric depth) ----
     metric_scale_enabled: bool = False
     """Insert the scale/shift aligner between depth inference and the
@@ -728,11 +734,21 @@ class PipelineManager:
         logger.info("Finalize: %d points, %d keyframes, %d iters @ %dpx (start PSNR %.2f dB)",
                     len(positions), len(views), self._config.finalize_iters, res, start)
 
+        densify_config = None
+        if self._config.finalize_densify:
+            from gaussian.densify import DensifyConfig
+            densify_config = DensifyConfig(
+                densify_interval=max(1, self._config.finalize_iters // 5),
+                stop_iter=int(self._config.finalize_iters * 0.8),
+                max_gaussians=self._config.finalize_max_points * 4,
+            )
+
         model, result = finalize_gaussians(
             points, views,
             max_points=self._config.finalize_max_points,
             iters=self._config.finalize_iters,
             ssim_weight=self._config.finalize_ssim_weight,
+            densify_config=densify_config,
         )
         self.optimized_gaussians = model
         self.finalize_result = result

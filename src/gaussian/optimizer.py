@@ -62,6 +62,27 @@ class _AdamState:
             param = getattr(model, name)
             param -= lr * mhat / (np.sqrt(vhat) + self.eps)
 
+    def rebuild(self, src_index: np.ndarray, n_final: int) -> None:
+        """Resize the Adam moments after densify/prune changed the Gaussian count.
+
+        ``src_index`` is (n_final,) mapping each surviving/new row to its old row
+        index, or -1 for a brand-new Gaussian (clone/split child), which starts
+        with zero moment. Keeps the momentum/variance of Gaussians that persisted.
+        """
+        src = np.asarray(src_index)
+        keep = src >= 0
+        for name in _FIELDS:
+            if name not in self.m:
+                continue
+            old_m, old_v = self.m[name], self.v[name]
+            shape = (n_final,) + old_m.shape[1:]
+            new_m = np.zeros(shape, dtype=old_m.dtype)
+            new_v = np.zeros(shape, dtype=old_v.dtype)
+            new_m[keep] = old_m[src[keep]]
+            new_v[keep] = old_v[src[keep]]
+            self.m[name] = new_m
+            self.v[name] = new_v
+
 
 def psnr(img: np.ndarray, target: np.ndarray) -> float:
     mse = float(np.mean((img - target) ** 2))
@@ -103,12 +124,16 @@ def fit(
     lr: LearningRates | None = None,
     log_every: int = 0,
     ssim_weight: float = 0.0,
+    densifier=None,
 ) -> FitResult:
     """Optimise ``model`` in place to reproduce ``views`` = [(camera, image)].
 
     ``ssim_weight`` (λ) blends the D-SSIM term into the photometric loss; 0 keeps
-    the original pure-L1 behaviour, 0.2 matches the 3DGS paper. Returns the
-    per-iteration photometric loss and mean PSNR across the views.
+    the original pure-L1 behaviour, 0.2 matches the 3DGS paper. ``densifier`` is
+    an optional :class:`densify.DensificationController`; when given, the
+    Adaptive Density Control loop clones/splits/prunes Gaussians during the fit
+    (the model's size changes). Returns the per-iteration photometric loss and
+    mean PSNR across the views.
     """
     opt = _AdamState(lr or LearningRates())
     losses: List[float] = []
@@ -116,6 +141,8 @@ def fit(
     for it in range(iters):
         # Accumulate gradients over all views (mini-batch = every view).
         grad_acc = {f: np.zeros_like(getattr(model, f)) for f in _FIELDS}
+        viewpos_acc = np.zeros((model.num_gaussians, 2))
+        vis_acc = np.zeros(model.num_gaussians)
         loss_sum = 0.0
         psnr_sum = 0.0
         for cam, target in views:
@@ -124,14 +151,21 @@ def fit(
             grads = rasterize_backward(grad_img, cache)
             for f in _FIELDS:
                 grad_acc[f] += grads[f]
+            viewpos_acc += grads["viewpos"]
+            vis_acc += grads["visible"]
             loss_sum += loss
             psnr_sum += psnr(img, target)
         n = len(views)
         for f in _FIELDS:
             grad_acc[f] /= n
+        if densifier is not None:
+            densifier.track(grad_acc["means"], viewpos_acc, vis_acc)
         opt.step(model, grad_acc)
+        if densifier is not None:
+            densifier.step(model, opt, it)
         losses.append(loss_sum / n)
         psnrs.append(psnr_sum / n)
         if log_every and (it % log_every == 0 or it == iters - 1):
-            print(f"[fit] it={it:4d}  L1={losses[-1]:.5f}  PSNR={psnrs[-1]:.2f} dB")
+            print(f"[fit] it={it:4d}  loss={losses[-1]:.5f}  PSNR={psnrs[-1]:.2f} dB"
+                  f"  N={model.num_gaussians}")
     return FitResult(losses, psnrs)

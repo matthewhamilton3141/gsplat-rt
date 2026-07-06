@@ -176,7 +176,11 @@ def rasterize_backward(grad_image: np.ndarray, cache: dict) -> dict:
     """Backprop dL/d(image) to raw Gaussian parameters (analytic gradients).
 
     Returns a dict of arrays matching ``GaussianModel`` fields, each (N, ...):
-    ``means``, ``log_scales``, ``quats``, ``opacities``, ``colors``.
+    ``means``, ``log_scales``, ``quats``, ``opacities``, ``colors``. Also returns
+    ``viewpos`` (N, 2) — the loss gradient w.r.t. each Gaussian's projected pixel
+    position — and ``visible`` (N,) — 1 where the Gaussian was splatted this view.
+    These are the signal Adaptive Density Control uses to decide where to
+    densify (see ``densify.py``); callers that don't densify can ignore them.
     """
     model: GaussianModel = cache["model"]
     cam: Camera = cache["cam"]
@@ -186,9 +190,12 @@ def rasterize_backward(grad_image: np.ndarray, cache: dict) -> dict:
     g_quats = np.zeros((N, 4))
     g_opacit = np.zeros((N,))
     g_colors = np.zeros((N, 3))
+    g_viewpos = np.zeros((N, 2))
+    g_visible = np.zeros((N,))
     if not cache["recs"]:
         return {"means": g_means, "log_scales": g_logscales, "quats": g_quats,
-                "opacities": g_opacit, "colors": g_colors}
+                "opacities": g_opacit, "colors": g_colors,
+                "viewpos": g_viewpos, "visible": g_visible}
 
     fx, fy = cam.fx, cam.fy
     scales = model.scales
@@ -237,6 +244,10 @@ def rasterize_backward(grad_image: np.ndarray, cache: dict) -> dict:
         grad_C = float((gp * (-0.5 * dy * dy)).sum())
         grad_u = float((gp * (A0 * dx + B0 * dy)).sum())
         grad_v = float((gp * (C0 * dy + B0 * dx)).sum())
+        # View-space position gradient + visibility (Adaptive Density Control).
+        g_viewpos[gidx, 0] += grad_u
+        g_viewpos[gidx, 1] += grad_v
+        g_visible[gidx] += 1.0
 
         # --- conic -> cov2d (a2,b2,c2) via explicit 2x2 inverse partials ---
         J = cache["J"][vidx]                     # (2, 3)
@@ -302,4 +313,5 @@ def rasterize_backward(grad_image: np.ndarray, cache: dict) -> dict:
         g_colors[gidx] += grad_rgb * rc * (1 - rc)
 
     return {"means": g_means, "log_scales": g_logscales, "quats": g_quats,
-            "opacities": g_opacit, "colors": g_colors}
+            "opacities": g_opacit, "colors": g_colors,
+            "viewpos": g_viewpos, "visible": g_visible}
