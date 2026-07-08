@@ -39,7 +39,10 @@ def _pose(i):
 
 
 def bench_numpy(grid, depths, poses, K):
-    vol = TSDFVolume(voxel_size=0.05, grid_dim=grid)
+    # Force the numpy path: TSDFVolume defaults to use_cuda=None (auto), which
+    # silently selects the CUDA kernel on a GPU box — making this "numpy"
+    # baseline secretly the CUDA path and collapsing the reported speed-up.
+    vol = TSDFVolume(voxel_size=0.05, grid_dim=grid, use_cuda=False)
     times = []
     for depth, pose in zip(depths, poses):
         t0 = time.perf_counter()
