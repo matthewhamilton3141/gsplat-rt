@@ -61,13 +61,19 @@ def main() -> int:
         from pipeline_manager import PipelineConfig, PipelineManager
         cfg = PipelineConfig(video_source=_parse_source(args.source),
                              realtime_source=isinstance(_parse_source(args.source), str))
-        manager = PipelineManager(cfg).start()
+        manager = PipelineManager(cfg)          # built now, started after the viewer
         source = PipelineSceneSource(manager)
         label = f"live pipeline: {args.source}"
 
+    # Start the web server first so the page is reachable immediately — before we
+    # touch the camera (which on macOS may block on a permission prompt).
     viewer = WebViewer(source, host=args.host, port=args.port,
                        max_points=args.max_points).start()
     print(f"\n  gsplat-rt viewer — {label}\n  open  {viewer.url}\n  Ctrl-C to stop\n")
+
+    if manager is not None:
+        print("  starting pipeline… (grant camera access if macOS prompts)\n")
+        manager.start()
 
     try:
         t0 = time.time()

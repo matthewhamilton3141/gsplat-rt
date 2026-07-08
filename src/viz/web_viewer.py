@@ -20,12 +20,33 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class _DualStackServer(ThreadingHTTPServer):
+    """IPv6 server that also accepts IPv4 connections.
+
+    macOS resolves ``localhost`` to IPv6 ``::1`` first, so an IPv4-only bind on
+    ``127.0.0.1`` leaves ``http://localhost:PORT`` unreachable. Binding IPv6
+    ``::`` with ``IPV6_V6ONLY`` off accepts both ``localhost``/``::1`` and
+    ``127.0.0.1`` (as an IPv4-mapped address).
+    """
+
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass
+        super().server_bind()
 
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 _CONTENT_TYPES = {".html": "text/html; charset=utf-8",
@@ -141,7 +162,17 @@ class WebViewer:
     def start(self) -> "WebViewer":
         if self._httpd is not None:
             raise RuntimeError("WebViewer already started")
-        httpd = ThreadingHTTPServer((self.host, self._requested_port), _Handler)
+        # For loopback-ish hosts, bind dual-stack so both localhost (IPv6 ::1) and
+        # 127.0.0.1 (IPv4) reach the server; fall back to a plain IPv4 bind if the
+        # box has no IPv6.
+        httpd = None
+        if self.host in ("127.0.0.1", "localhost", "::1", "::", ""):
+            try:
+                httpd = _DualStackServer(("::", self._requested_port), _Handler)
+            except OSError:
+                httpd = None
+        if httpd is None:
+            httpd = ThreadingHTTPServer((self.host, self._requested_port), _Handler)
         httpd.source = self.source              # handler reads these off the server
         httpd.max_points = self.max_points
         httpd.daemon_threads = True

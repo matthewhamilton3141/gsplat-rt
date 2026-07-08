@@ -19,6 +19,7 @@ camera.position.set(3, 2, 4);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
+controls.zoomSpeed = 3.0;         // snappier scroll/trackpad zoom
 
 // A subtle ground grid gives the scene a sense of scale/orientation.
 const grid = new THREE.GridHelper(10, 20, 0x1c2530, 0x141a20);
@@ -71,19 +72,28 @@ function rebuildPoints(scn) {
   points = new THREE.Points(geo, splatMaterial);
   points.frustumCulled = false;
   scene.add(points);
-  if (!framedOnce && n > 0) { frameTo(scn.bbox); framedOnce = true; }
+  if (!framedOnce && n > 0) { frameTo(scn.bbox, centroid(scn.means)); framedOnce = true; }
 }
 
-function frameTo(bbox) {
+function centroid(means) {
+  let x = 0, y = 0, z = 0;
+  const n = means.length / 3;
+  for (let i = 0; i < means.length; i += 3) { x += means[i]; y += means[i + 1]; z += means[i + 2]; }
+  return n ? new THREE.Vector3(x / n, y / n, z / n) : new THREE.Vector3();
+}
+
+function frameTo(bbox, target) {
   const mn = new THREE.Vector3().fromArray(bbox.min);
   const mx = new THREE.Vector3().fromArray(bbox.max);
-  const center = mn.clone().add(mx).multiplyScalar(0.5);
   const radius = Math.max(mx.distanceTo(mn) * 0.5, 0.5);
-  controls.target.copy(center);
-  camera.position.copy(center).add(new THREE.Vector3(1, 0.7, 1)
-    .normalize().multiplyScalar(radius * 2.6));
+  // Look at the cloud's centroid (≈ origin for the demo sphere) and place the
+  // camera so it sits centred on screen.
+  controls.target.copy(target);
+  camera.position.copy(target).add(new THREE.Vector3(1, 0.7, 1)
+    .normalize().multiplyScalar(radius * 2.2));
   camera.near = radius / 100; camera.far = radius * 100;
   camera.updateProjectionMatrix();
+  controls.update();               // apply the new target/position immediately
 }
 
 // --- occupancy panel (top-down floor plan) -------------------------------
@@ -142,7 +152,7 @@ function fmt(v, d = 1) { return (v === undefined || v === null) ? '—' : Number
 // --- render loop + resize ------------------------------------------------
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
-  renderer.setSize(w, h, false);
+  renderer.setSize(w, h);          // also sets the canvas CSS size to fill the viewport
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   // Match on-screen disc size to projected world size (drawing-buffer pixels).
