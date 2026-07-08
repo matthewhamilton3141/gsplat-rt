@@ -40,6 +40,8 @@ def main() -> int:
     ap.add_argument("--ply", default=None, help="view a static .ply instead")
     ap.add_argument("--demo", action="store_true",
                     help="serve a procedural scene (no pipeline, no GPU)")
+    ap.add_argument("--scene", default="sphere", choices=["sphere", "plane", "axes"],
+                    help="procedural demo shape (--demo): sphere, plane, or axes")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--max-points", type=int, default=20000,
@@ -55,8 +57,8 @@ def main() -> int:
         source = PlySceneSource(args.ply)
         label = f"ply: {args.ply}"
     elif args.demo or args.source is None:
-        source = SyntheticSceneSource()
-        label = "demo (procedural scene)"
+        source = SyntheticSceneSource(shape=args.scene)
+        label = f"demo ({args.scene})"
     else:
         from pipeline_manager import PipelineConfig, PipelineManager
         cfg = PipelineConfig(video_source=_parse_source(args.source),

@@ -225,25 +225,31 @@ class PlySceneSource:
 
 
 class SyntheticSceneSource:
-    """Procedural scene — GPU-free viewer smoke tests.
+    """Procedural anisotropic scene — GPU-free viewer test bed.
 
-    An anisotropic sphere shell: each splat is a flat disc tangent to the sphere
-    (two large axes in the surface, one thin axis along the normal), so it
-    exercises the oriented-ellipse renderer, not just round dots.
+    ``shape`` selects a scene with *known* per-splat orientation/stretch, so the
+    oriented-ellipse renderer can be checked by eye:
+
+      "axes"   — three stretched bars along X(red)/Y(green)/Z(blue). The clearest
+                 orientation test: correct rendering shows three thin streaks
+                 pointing down the right axes.
+      "plane"  — a flat floor of discs lying in the XZ plane (thin along Y).
+      "sphere" — a shell of discs tangent to the sphere (the pretty one, but a
+                 poor diagnostic since all discs look alike).
     """
 
-    def __init__(self, n: int = 3000, seed: int = 0):
+    def __init__(self, n: int = 8000, seed: int = 0, shape: str = "sphere"):
+        self.shape = shape
         rng = np.random.default_rng(seed)
-        d = rng.standard_normal((n, 3))
-        d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
-        self._means = d * (1.0 + 0.02 * rng.standard_normal((n, 1)))
-        self._colors = 0.5 + 0.5 * d           # direction → colour
-        self._opac = np.full(n, 0.9)
-        # Per-splat: a flat oriented disc tangent to the sphere. z-axis (thin) =
-        # surface normal d; scales = (wide, wide, thin).
-        self._scales3 = np.tile([0.06, 0.06, 0.008], (n, 1)).astype(np.float64)
-        self._quats = _quats_from_normal(d)
-        self._scales = self._scales3.mean(axis=1)
+        if shape == "axes":
+            m, c, s3, q = _scene_axes(rng, n)
+        elif shape == "plane":
+            m, c, s3, q = _scene_plane(rng, n)
+        else:
+            m, c, s3, q = _scene_sphere(rng, n)
+        self._means, self._colors, self._scales3, self._quats = m, c, s3, q
+        self._opac = np.full(m.shape[0], 0.85)
+        self._scales = s3.mean(axis=1)
         self._tick = 0
 
     def snapshot(self) -> SceneSnapshot:
@@ -251,9 +257,52 @@ class SyntheticSceneSource:
         return SceneSnapshot(
             self._means.copy(), np.clip(self._colors, 0, 1).copy(),
             self._scales.copy(), self._opac.copy(),
-            occupancy=None, stats={"source": "synthetic", "tick": self._tick,
+            occupancy=None, stats={"source": "synthetic", "shape": self.shape,
+                                   "tick": self._tick,
                                    "count": int(self._means.shape[0])},
             scales3=self._scales3.copy(), quats=self._quats.copy())
+
+
+def _scene_sphere(rng, n):
+    # Dense (default n) so medium tangent discs tile the surface with no holes and
+    # still blend into a smooth shell (not oversized blobs).
+    d = rng.standard_normal((n, 3))
+    d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+    means = d * (1.0 + 0.015 * rng.standard_normal((n, 1)))
+    colors = 0.5 + 0.5 * d
+    scales3 = np.tile([0.045, 0.045, 0.006], (n, 1)).astype(np.float64)
+    return means, colors, scales3, _quats_from_normal(d)
+
+
+def _scene_plane(rng, n):
+    xz = rng.uniform(-1.0, 1.0, (n, 2))
+    means = np.column_stack([xz[:, 0], np.zeros(n), xz[:, 1]])
+    colors = 0.5 + 0.5 * np.column_stack([xz[:, 0], np.zeros(n), xz[:, 1]])
+    scales3 = np.tile([0.06, 0.004, 0.06], (n, 1)).astype(np.float64)   # thin along Y
+    quats = np.tile([1.0, 0.0, 0.0, 0.0], (n, 1)).astype(np.float64)    # identity
+    return means, np.clip(colors, 0, 1), scales3, quats
+
+
+def _scene_axes(rng, n):
+    """Three orthogonal bars of splats, each stretched along its own axis."""
+    per = max(n // 3, 1)
+    t = np.linspace(-1.0, 1.0, per)[:, None]
+    zeros = np.zeros((per, 1))
+    x_bar = np.concatenate([t, zeros, zeros], axis=1)
+    y_bar = np.concatenate([zeros, t, zeros], axis=1)
+    z_bar = np.concatenate([zeros, zeros, t], axis=1)
+    means = np.concatenate([x_bar, y_bar, z_bar], axis=0)
+    red = np.tile([0.9, 0.2, 0.2], (per, 1))
+    green = np.tile([0.2, 0.9, 0.2], (per, 1))
+    blue = np.tile([0.3, 0.4, 0.95], (per, 1))
+    colors = np.concatenate([red, green, blue], axis=0)
+    long_, thin = 0.06, 0.012
+    sx = np.tile([long_, thin, thin], (per, 1))   # stretched along X
+    sy = np.tile([thin, long_, thin], (per, 1))   # along Y
+    sz = np.tile([thin, thin, long_], (per, 1))   # along Z
+    scales3 = np.concatenate([sx, sy, sz], axis=0)
+    quats = np.tile([1.0, 0.0, 0.0, 0.0], (means.shape[0], 1)).astype(np.float64)
+    return means, colors, scales3, quats
 
 
 def _quats_from_normal(normals: np.ndarray) -> np.ndarray:
