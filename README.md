@@ -116,6 +116,18 @@ live_scene_splat_preview.png  — depth-colored splat cloud preview
 
 The PNGs are overwritten in place on every export, so they always reflect the latest scene. Set `write_previews=False` on `PipelineConfig` to skip them.
 
+### Step 3b — watch it in 3D (browser viewer)
+
+For a live **3-D** view of the splats forming — orbit/zoom in the browser, no Omniverse needed:
+
+```bash
+python scripts/run_viewer.py --source 0          # live pipeline (webcam)
+python scripts/run_viewer.py --ply output/live_scene.ply   # a static .ply
+python scripts/run_viewer.py --demo              # procedural scene, no GPU/pipeline
+```
+
+Then open **http://localhost:8000**. The splats render as soft Gaussian discs (sized by scale, coloured per-splat once the finalize stage runs, else by height), with the top-down occupancy map and live stats (FPS, depth latency, splat count, metric scale) in overlays. The backend is **pure stdlib** (`http.server` + numpy — no new dependencies); the page pulls Three.js from a CDN. It only *reads* the pipeline via `latest_gaussians()` / `latest_occupancy()` / `stats()`, so it's fully decoupled from the hot path and never perturbs throughput. Works GPU-free (mock depth), so you can demo the whole thing on a laptop.
+
 Or drive it from Python directly:
 
 ```python
@@ -162,9 +174,14 @@ gsplat-rt/
 │   │   ├── collision_proxy.py    # TSDF volume + async mesh extractor + occupancy grid
 │   │   ├── usd_bridge.py         # OpenUSD stage writer
 │   │   └── visualization.py      # occupancy map + splat preview PNGs (numpy + cv2)
+│   ├── viz/
+│   │   ├── scene_source.py       # pipeline/.ply/synthetic → SceneSnapshot (+ PLY reader)
+│   │   ├── web_viewer.py         # stdlib ThreadingHTTPServer + JSON scene feed
+│   │   └── static/               # Three.js SPA (index.html + viewer.js)
 │   └── pipeline_manager.py       # central orchestrator (optional pose provider)
 ├── scripts/
 │   ├── run_live.py               # run + watch live (dashboard + ASCII map)
+│   ├── run_viewer.py             # live 3-D browser viewer (splats + occupancy)
 │   ├── bench_pipeline.py         # per-stage latency + FPS benchmark
 │   ├── reconstruct_tum.py        # identity-vs-ground-truth-pose fusion proof
 │   ├── eval_odometry.py          # visual-odometry ATE + trajectory render
