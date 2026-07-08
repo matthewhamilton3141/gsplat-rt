@@ -65,8 +65,15 @@ let lastBBox = null, lastCentroid = null;
 
 function rebuildPoints(scn) {
   const n = scn.count | 0;
+  // The pipeline uses computer-vision camera coords (+Y down); Three.js is +Y up.
+  // Flip Y for display so the scene is right-side-up. Viewer-only — the pipeline's
+  // convention is untouched. Radius (bbox diagonal) is invariant to the flip, so
+  // we only need the flipped centroid for the camera target.
+  const means = Float32Array.from(scn.means);
+  for (let i = 1; i < means.length; i += 3) means[i] = -means[i];
+
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(scn.means, 3));
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(means, 3));
   geo.setAttribute('aColor', new THREE.Float32BufferAttribute(scn.colors, 3));
   geo.setAttribute('aScale', new THREE.Float32BufferAttribute(scn.scales, 1));
   geo.setAttribute('aOpacity', new THREE.Float32BufferAttribute(scn.opacities, 1));
@@ -76,7 +83,7 @@ function rebuildPoints(scn) {
   scene.add(points);
 
   lastBBox = scn.bbox;
-  lastCentroid = centroid(scn.means);
+  lastCentroid = centroid(means);
   // Auto-frame on first data, and again whenever the scene goes empty→populated
   // (e.g. a live pipeline's first splats, or switching source without reload).
   if (n > 0 && (!framedOnce || lastCount === 0)) {
