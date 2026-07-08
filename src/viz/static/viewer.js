@@ -19,7 +19,7 @@ camera.position.set(3, 2, 4);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-controls.zoomSpeed = 3.0;         // snappier scroll/trackpad zoom
+controls.zoomSpeed = 10.0;        // very snappy scroll/trackpad zoom
 
 // A subtle ground grid gives the scene a sense of scale/orientation.
 const grid = new THREE.GridHelper(10, 20, 0x1c2530, 0x141a20);
