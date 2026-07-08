@@ -47,6 +47,10 @@ def test_live_pipeline_feeds_viewer():
         video = os.path.join(tmp, "clip.mp4")
         _make_video(video)
         cfg = PipelineConfig(video_source=video, output_dir=tmp,
+                             # Force mock depth so the backend assert below is
+                             # deterministic on a GPU box (real engine at the
+                             # default path would auto-select 'tensorrt').
+                             engine_path="/nonexistent/force-mock.engine",
                              write_previews=False, usd_update_interval_s=60.0,
                              tsdf_grid_dim=32, tsdf_voxel_size=0.1)
         mgr = PipelineManager(cfg).start()
@@ -66,5 +70,5 @@ def test_live_pipeline_feeds_viewer():
         assert mgr.frames_processed > 0
         assert scn["count"] > 0                      # splats reached the browser feed
         assert len(scn["means"]) == 3 * scn["count"]
-        assert stats["depth_backend"] == "mock"      # GPU-free run
+        assert stats["depth_backend"] == "mock"      # forced mock (see cfg above)
         assert stats["frames"] > 0

@@ -63,6 +63,10 @@ class _RecordingPose:
 def _base_cfg(tmp, **kw):
     base = dict(
         output_dir=tmp, usd_stem="mscale",
+        # Force the mock depth estimator regardless of environment: on a GPU box
+        # a real engine at the default path would otherwise be auto-selected and
+        # break the exact-scale asserts below (this file is mock-by-design).
+        engine_path="/nonexistent/force-mock.engine",
         depth_input_h=64, depth_input_w=64, gaussian_sample_step=8,
         write_previews=False, usd_update_interval_s=60.0,
         usd_update_frame_count=10_000, tsdf_grid_dim=32, tsdf_voxel_size=0.10,
@@ -113,14 +117,14 @@ def test_metric_scale_rescales_depth_before_consumers():
         cfg = _base_cfg(tmp, metric_scale_enabled=True,
                         metric_scale_space="depth", metric_scale_smoothing=0.0,
                         metric_scale_min_points=10, metric_scale_clamp=None)
-    mgr, rec, stats = _run(cfg, scale_reference=scale_reference)
+        mgr, rec, stats = _run(cfg, scale_reference=scale_reference)
 
-    assert mgr._aligner is not None
-    got = rec.latest()
-    assert got is not None
-    # Depth the pose provider received is 3x the raw mock bowl (~2.4 m → ~7.2 m).
-    assert 6.5 < float(np.median(got)) < 8.0
-    assert stats.get("metric_scale") == pytest.approx(3.0, rel=1e-3)
+        assert mgr._aligner is not None
+        got = rec.latest()
+        assert got is not None
+        # Depth the pose provider received is 3x the raw mock bowl (~2.4 m → ~7.2 m).
+        assert 6.5 < float(np.median(got)) < 8.0
+        assert stats.get("metric_scale") == pytest.approx(3.0, rel=1e-3)
 
 
 def test_metric_scale_enabled_without_reference_is_identity():
