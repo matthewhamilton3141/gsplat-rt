@@ -118,7 +118,11 @@ The PNGs are overwritten in place on every export, so they always reflect the la
 
 ### Step 3b — watch it in 3D (browser viewer)
 
-![gsplat-rt live viewer — soft Gaussian-disc splats with a live stats HUD and top-down occupancy panel](docs/viewer.png)
+The viewer renders the scene as **anisotropic Gaussian splats** — oriented ellipses from each Gaussian's covariance (EWA projection + depth-sorted alpha compositing), the same math the CPU rasterizer uses. Press **`A`** to toggle between that and a plain isotropic point cloud, live, on the same scene:
+
+| isotropic points | anisotropic Gaussian splats (**`A`** to toggle) |
+|:---:|:---:|
+| ![isotropic point rendering](docs/viewer_points.png) | ![anisotropic Gaussian-splat rendering](docs/viewer_splats.png) |
 
 For a live **3-D** view of the splats forming — orbit/zoom in the browser, no Omniverse needed:
 
@@ -128,7 +132,7 @@ python scripts/run_viewer.py --ply output/live_scene.ply   # a static .ply
 python scripts/run_viewer.py --demo              # procedural scene, no GPU/pipeline
 ```
 
-Then open **http://localhost:8000**. The splats render as soft Gaussian discs (sized by scale, coloured per-splat once the finalize stage runs, else by height), with the top-down occupancy map and live stats (FPS, depth latency, splat count, metric scale) in overlays. The backend is **pure stdlib** (`http.server` + numpy — no new dependencies); the page pulls Three.js from a CDN. It only *reads* the pipeline via `latest_gaussians()` / `latest_occupancy()` / `stats()`, so it's fully decoupled from the hot path and never perturbs throughput. Works GPU-free (mock depth), so you can demo the whole thing on a laptop.
+Then open **http://localhost:8000**. Gaussians with real shape (optimized splats or a `.ply`) render as **anisotropic oriented ellipses**; a raw point cloud falls back to soft round discs — press **`A`** to compare. Splats are coloured per-splat (from the optimizer or the live source frame) or by height, with the top-down occupancy map and live stats (FPS, depth latency, splat count, metric scale) in overlays. Procedural demo shapes: `--scene sphere|plane|axes`. The backend is **pure stdlib** (`http.server` + numpy — no new dependencies); the page pulls Three.js from a CDN. It only *reads* the pipeline via `latest_gaussians()` / `latest_occupancy()` / `stats()`, so it's fully decoupled from the hot path and never perturbs throughput. Works GPU-free (mock depth), so you can demo the whole thing on a laptop.
 
 Or drive it from Python directly:
 
