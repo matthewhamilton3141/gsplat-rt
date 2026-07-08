@@ -64,6 +64,9 @@ def main():
                          "(SuperPoint+LightGlue ONNX)")
     ap.add_argument("--sp-onnx", default="weights/sp_lg_tum.onnx",
                     help="fused SuperPoint+LightGlue ONNX (for --frontend superpoint)")
+    ap.add_argument("--provider", choices=["cuda", "tensorrt", "cpu"], default="cuda",
+                    help="onnxruntime execution provider (for --frontend superpoint); "
+                         "tensorrt builds/caches an FP16 TRT engine from the ONNX")
     args = ap.parse_args()
 
     ds = TUMDataset(args.seq)
@@ -71,8 +74,20 @@ def main():
 
     if args.frontend == "superpoint":
         from slam.superpoint_lightglue import SuperPointLightGlueFrontend
+        cache = os.path.join(os.path.dirname(args.sp_onnx) or ".", ".trt_cache")
+        providers = {
+            "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            "cpu": ["CPUExecutionProvider"],
+            "tensorrt": [
+                ("TensorrtExecutionProvider",
+                 {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
+                  "trt_engine_cache_path": cache}),
+                "CUDAExecutionProvider", "CPUExecutionProvider",
+            ],
+        }[args.provider]
         K = ds.intrinsics
-        fe = SuperPointLightGlueFrontend(args.sp_onnx, height=K.height, width=K.width)
+        fe = SuperPointLightGlueFrontend(args.sp_onnx, height=K.height, width=K.width,
+                                         providers=providers)
         print(f"Front-end     : SuperPoint+LightGlue ONNX  (providers={fe.providers})")
         odom = RGBDOdometry(ds.intrinsics, frontend=fe)
     else:
