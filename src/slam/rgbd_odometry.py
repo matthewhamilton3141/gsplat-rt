@@ -152,6 +152,19 @@ class RGBDOdometry:
 
     def track(self, rgb: np.ndarray, depth: np.ndarray,
               init_pose: Optional[np.ndarray] = None) -> TrackResult:
+        """Estimate the next camera-to-world pose from an (rgb, depth) pair.
+
+        Dispatches to the pairwise branch when the front-end exposes
+        ``match_pair`` (learned matchers like LightGlue jointly match an image
+        pair, returning corresponding pixels directly), otherwise the detect +
+        descriptor-match branch (the ORB baseline).
+        """
+        if hasattr(self._frontend, "match_pair"):
+            return self._track_pairwise(rgb, depth, init_pose)
+        return self._track_detect_match(rgb, depth, init_pose)
+
+    def _track_detect_match(self, rgb: np.ndarray, depth: np.ndarray,
+                            init_pose: Optional[np.ndarray] = None) -> TrackResult:
         xy, des = self._frontend.detect(rgb)
 
         if self._prev is None:
@@ -190,6 +203,50 @@ class RGBDOdometry:
         self._prev = (xy, des, depth)
         self.trajectory.append(self._pose.copy())
         return TrackResult(self._pose.copy(), len(matches), n_inliers, ok)
+
+    def _track_pairwise(self, rgb: np.ndarray, depth: np.ndarray,
+                        init_pose: Optional[np.ndarray] = None) -> TrackResult:
+        """Learned-matcher branch: the front-end matches (prev_rgb, rgb)
+        directly to corresponding pixels (uv0, uv1); uv0 back-projects through
+        the previous depth into the same RANSAC-PnP as the ORB path."""
+        if self._prev is None:
+            if init_pose is not None:
+                self._pose = init_pose.astype(np.float64).copy()
+            self._prev = (rgb, depth)     # pairwise caches the raw frame, not features
+            self.trajectory.append(self._pose.copy())
+            return TrackResult(self._pose.copy(), 0, 0, True)
+
+        prev_rgb, prev_depth = self._prev
+        uv0, uv1 = self._frontend.match_pair(prev_rgb, rgb)
+        uv0 = np.asarray(uv0, dtype=np.float32).reshape(-1, 2)
+        uv1 = np.asarray(uv1, dtype=np.float64).reshape(-1, 2)
+        n_matches = len(uv0)
+
+        ok = False
+        n_inliers = 0
+        if n_matches >= self.min_matches:
+            pts3d_prev, valid = self._backproject(uv0, prev_depth)
+            obj = pts3d_prev[valid]
+            img = uv1[valid]
+            if len(obj) >= self.min_matches:
+                retval, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    obj, img, self._Kmat, None,
+                    reprojectionError=self.ransac_reproj_px,
+                    iterationsCount=100, flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if retval and inliers is not None and len(inliers) >= 6:
+                    R, _ = cv2.Rodrigues(rvec)
+                    T_rel = np.eye(4)
+                    T_rel[:3, :3] = R
+                    T_rel[:3, 3] = tvec.ravel()
+                    self._last_rel = _invert_se3(T_rel)
+                    n_inliers = len(inliers)
+                    ok = True
+
+        self._pose = self._pose @ self._last_rel
+        self._prev = (rgb, depth)
+        self.trajectory.append(self._pose.copy())
+        return TrackResult(self._pose.copy(), n_matches, n_inliers, ok)
 
 
 class OdometryPoseProvider:
