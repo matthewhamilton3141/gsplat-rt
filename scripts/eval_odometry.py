@@ -73,21 +73,10 @@ def main():
     frames = ds.frames[:args.max_frames] if args.max_frames > 0 else ds.frames
 
     if args.frontend == "superpoint":
-        from slam.superpoint_lightglue import SuperPointLightGlueFrontend
-        cache = os.path.join(os.path.dirname(args.sp_onnx) or ".", ".trt_cache")
-        providers = {
-            "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-            "cpu": ["CPUExecutionProvider"],
-            "tensorrt": [
-                ("TensorrtExecutionProvider",
-                 {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
-                  "trt_engine_cache_path": cache}),
-                "CUDAExecutionProvider", "CPUExecutionProvider",
-            ],
-        }[args.provider]
+        from slam.superpoint_lightglue import SuperPointLightGlueFrontend, ort_providers
         K = ds.intrinsics
         fe = SuperPointLightGlueFrontend(args.sp_onnx, height=K.height, width=K.width,
-                                         providers=providers)
+                                         providers=ort_providers(args.provider, args.sp_onnx))
         print(f"Front-end     : SuperPoint+LightGlue ONNX  (providers={fe.providers})")
         odom = RGBDOdometry(ds.intrinsics, frontend=fe)
     else:

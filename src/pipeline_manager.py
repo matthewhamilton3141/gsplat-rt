@@ -166,6 +166,25 @@ class PipelineConfig:
     translation (metres) pins true metric scale; 1.0 gives a globally-consistent
     but arbitrary absolute scale (the honest monocular limit)."""
 
+    # ---- Pose tracking (M6 visual odometry) ------------------------------
+    pose_tracking: str = "none"
+    """Auto-build a VO pose provider when none is injected to PipelineManager:
+    'none' (fixed camera, identity), 'orb' (CPU baseline), or 'superpoint'
+    (SuperPoint+LightGlue ONNX). Only produces a coherent world map with metric,
+    scale-consistent depth (RGB-D sensor / TUM). On build failure the pipeline
+    coasts at identity (a warning), so a run never crashes for lack of a tracker."""
+
+    pose_onnx_path: str = "models/sp_lg_tum.onnx"
+    """Fused SuperPoint+LightGlue ONNX, for pose_tracking='superpoint'
+    (regenerate with scripts/export_sp_lg.sh)."""
+
+    pose_onnx_hw: tuple = (480, 640)
+    """(height, width) the pose ONNX was exported at (model input size)."""
+
+    pose_backend: str = "tensorrt"
+    """onnxruntime provider for pose_tracking='superpoint': 'tensorrt' (FP16 TRT
+    EP + engine cache — measured 7.4 ms/frame on A10G), 'cuda', or 'cpu'."""
+
 
 # ---------------------------------------------------------------------------
 # Mock depth estimator (CUDA / TRT absent)
@@ -381,6 +400,42 @@ class PipelineManager:
                 "Could not build MonocularScaleReference — aligner runs as "
                 "identity (depth stays relative).")
 
+    def _maybe_build_pose_provider(self) -> None:
+        """Auto-wire a VO pose provider from config when none was injected.
+
+        ``cfg.pose_tracking`` selects the front-end: 'orb' (CPU baseline) or
+        'superpoint' (SuperPoint+LightGlue ONNX via onnxruntime, provider from
+        ``cfg.pose_backend``). Needs metric, scale-consistent depth to yield a
+        coherent world map. Any failure (missing ONNX, onnxruntime absent) is
+        caught and the pipeline coasts at identity — a run never crashes here.
+        """
+        cfg = self._config
+        if self._pose_provider is not None or cfg.pose_tracking == "none":
+            return
+        try:
+            from slam.rgbd_odometry import OdometryPoseProvider
+            if cfg.pose_tracking == "orb":
+                self._pose_provider = OdometryPoseProvider(self._camera_k)
+                logger.info("Pose provider: ORB visual odometry")
+            elif cfg.pose_tracking == "superpoint":
+                from slam.superpoint_lightglue import (
+                    SuperPointLightGlueFrontend, ort_providers,
+                )
+                h, w = cfg.pose_onnx_hw
+                fe = SuperPointLightGlueFrontend(
+                    cfg.pose_onnx_path, height=h, width=w,
+                    providers=ort_providers(cfg.pose_backend, cfg.pose_onnx_path))
+                self._pose_provider = OdometryPoseProvider(self._camera_k, frontend=fe)
+                logger.info("Pose provider: SuperPoint+LightGlue (%s, providers=%s)",
+                            cfg.pose_onnx_path, fe.providers)
+            else:
+                logger.warning("Unknown pose_tracking=%r — fusing at identity",
+                               cfg.pose_tracking)
+        except Exception:
+            logger.exception(
+                "Could not build pose provider (pose_tracking=%s) — fusing at "
+                "identity (fixed camera).", cfg.pose_tracking)
+
     def _init_usd_bridge(self) -> None:
         """Create the in-memory USD stage. No-op if pxr is not installed."""
         try:
@@ -440,6 +495,9 @@ class PipelineManager:
 
         # ---- Monocular scale reference (needs intrinsics, so after _camera_k) ----
         self._maybe_build_monocular_reference()
+
+        # ---- Pose provider (needs intrinsics; skipped if one was injected) ----
+        self._maybe_build_pose_provider()
 
         # ---- USD bridge ----
         self._init_usd_bridge()

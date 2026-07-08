@@ -18,10 +18,30 @@ not require it — the session is created lazily in the constructor.
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+def ort_providers(backend: str, onnx_path: str = "") -> list:
+    """onnxruntime execution-provider list for a backend.
+
+    'tensorrt' → FP16 TensorRT EP (with an on-disk engine cache next to the
+    ONNX) then CUDA/CPU fallback; 'cuda' → CUDA then CPU; 'cpu' → CPU only.
+    """
+    if backend == "cpu":
+        return ["CPUExecutionProvider"]
+    if backend == "tensorrt":
+        cache = os.path.join(os.path.dirname(onnx_path) or ".", ".trt_cache")
+        return [
+            ("TensorrtExecutionProvider",
+             {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
+              "trt_engine_cache_path": cache}),
+            "CUDAExecutionProvider", "CPUExecutionProvider",
+        ]
+    return ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
 
 class SuperPointLightGlueFrontend:
