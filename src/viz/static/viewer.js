@@ -60,6 +60,8 @@ const splatMaterial = new THREE.ShaderMaterial({
 
 let points = null;
 let framedOnce = false;
+let lastCount = 0;
+let lastBBox = null, lastCentroid = null;
 
 function rebuildPoints(scn) {
   const n = scn.count | 0;
@@ -72,8 +74,22 @@ function rebuildPoints(scn) {
   points = new THREE.Points(geo, splatMaterial);
   points.frustumCulled = false;
   scene.add(points);
-  if (!framedOnce && n > 0) { frameTo(scn.bbox, centroid(scn.means)); framedOnce = true; }
+
+  lastBBox = scn.bbox;
+  lastCentroid = centroid(scn.means);
+  // Auto-frame on first data, and again whenever the scene goes empty→populated
+  // (e.g. a live pipeline's first splats, or switching source without reload).
+  if (n > 0 && (!framedOnce || lastCount === 0)) {
+    frameTo(lastBBox, lastCentroid);
+    framedOnce = true;
+  }
+  lastCount = n;
 }
+
+// Press F to re-fit the camera to the current cloud (handy if you orbit away).
+window.addEventListener('keydown', (e) => {
+  if ((e.key === 'f' || e.key === 'F') && lastBBox) frameTo(lastBBox, lastCentroid);
+});
 
 function centroid(means) {
   let x = 0, y = 0, z = 0;

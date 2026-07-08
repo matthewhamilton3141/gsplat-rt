@@ -130,3 +130,29 @@ def test_pipeline_source_empty_cloud():
     snap = PipelineSceneSource(_FakeManager(None)).snapshot()
     assert snap.count == 0
     assert snap.means.shape == (0, 3)
+
+
+class _FakeManagerWithColors(_FakeManager):
+    def __init__(self, pts, cols, **kw):
+        super().__init__(pts, **kw)
+        self._cols = cols
+
+    def latest_gaussian_colors(self):
+        return self._cols
+
+
+def test_pipeline_source_uses_sampled_colors():
+    pts = np.random.default_rng(5).uniform(-1, 1, (30, 3))
+    cols = np.random.default_rng(6).uniform(0, 1, (30, 3))
+    snap = PipelineSceneSource(_FakeManagerWithColors(pts, cols)).snapshot()
+    assert snap.count == 30
+    assert np.allclose(snap.colors, cols, atol=1e-9)      # real colours, not height ramp
+
+
+def test_pipeline_source_truncates_color_length_mismatch():
+    # Writer appended points after colours were snapshotted → longer pts.
+    pts = np.random.default_rng(7).uniform(-1, 1, (30, 3))
+    cols = np.random.default_rng(8).uniform(0, 1, (25, 3))
+    snap = PipelineSceneSource(_FakeManagerWithColors(pts, cols)).snapshot()
+    assert snap.count == 25                                # truncated to common length
+    assert np.allclose(snap.colors, cols[:25], atol=1e-9)

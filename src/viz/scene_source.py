@@ -245,7 +245,17 @@ class PipelineSceneSource:
         else:
             pts = m.latest_gaussians()
             pts = np.zeros((0, 3)) if pts is None else np.asarray(pts, np.float64)
-            snap = _normalise(pts, None, None, None, pts.shape[0])
+            # Real per-point source-frame colour if the pipeline sampled it, else
+            # None → _normalise falls back to the height ramp. Truncate to the
+            # common length (the writer may append between the two snapshots).
+            cols = (m.latest_gaussian_colors()
+                    if hasattr(m, "latest_gaussian_colors") else None)
+            if cols is not None and len(cols):
+                k = min(len(pts), len(cols))
+                pts, cols = pts[:k], np.asarray(cols)[:k]
+            else:
+                cols = None
+            snap = _normalise(pts, cols, None, None, pts.shape[0])
 
         occ = m.latest_occupancy() if hasattr(m, "latest_occupancy") else None
         snap.occupancy = None if occ is None else np.asarray(occ)
