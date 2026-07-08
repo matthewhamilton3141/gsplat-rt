@@ -118,6 +118,8 @@ The PNGs are overwritten in place on every export, so they always reflect the la
 
 ### Step 3b — watch it in 3D (browser viewer)
 
+![gsplat-rt live viewer — soft Gaussian-disc splats with a live stats HUD and top-down occupancy panel](docs/viewer.png)
+
 For a live **3-D** view of the splats forming — orbit/zoom in the browser, no Omniverse needed:
 
 ```bash
