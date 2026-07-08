@@ -65,18 +65,29 @@ def _hsv_to_rgb(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
 
 @dataclass
 class SceneSnapshot:
-    """One frame of scene state for the viewer."""
+    """One frame of scene state for the viewer.
+
+    ``scales3`` (per-axis stddev) + ``quats`` (orientation) are the anisotropy the
+    real splat renderer needs; they're optional (a raw point cloud has neither,
+    and the viewer falls back to round isotropic discs of size ``scales``).
+    """
 
     means: np.ndarray                       # (N, 3) float
     colors: np.ndarray                      # (N, 3) float in [0, 1]
-    scales: np.ndarray                      # (N,) world-space splat size
+    scales: np.ndarray                      # (N,) isotropic fallback size
     opacities: np.ndarray                   # (N,) in [0, 1]
     occupancy: Optional[np.ndarray] = None  # (X, Z) int {-1,0,1} or None
     stats: dict = field(default_factory=dict)
+    scales3: Optional[np.ndarray] = None    # (N, 3) per-axis world stddev
+    quats: Optional[np.ndarray] = None      # (N, 4) (w,x,y,z) orientation
 
     @property
     def count(self) -> int:
         return int(self.means.shape[0])
+
+    @property
+    def anisotropic(self) -> bool:
+        return self.scales3 is not None and self.quats is not None
 
     def bbox(self):
         """(min[3], max[3]) of the centres, or unit cube when empty."""
@@ -93,7 +104,9 @@ class SceneSnapshot:
         idx = rng.choice(n, size=max_points, replace=False)
         return SceneSnapshot(
             self.means[idx], self.colors[idx], self.scales[idx],
-            self.opacities[idx], self.occupancy, self.stats)
+            self.opacities[idx], self.occupancy, self.stats,
+            scales3=None if self.scales3 is None else self.scales3[idx],
+            quats=None if self.quats is None else self.quats[idx])
 
 
 def _normalise(means, colors, scales, opacities, n) -> SceneSnapshot:
@@ -168,22 +181,30 @@ def read_ply(path: str) -> SceneSnapshot:
 
     means = np.stack([col("x"), col("y"), col("z")], axis=-1) if n else np.zeros((0, 3))
 
+    scales3 = quats = None
     if "f_dc_0" in names:                       # 3DGS splat file
         f_dc = np.stack([col("f_dc_0"), col("f_dc_1"), col("f_dc_2")], axis=-1)
         colors = _SH_C0 * f_dc + 0.5
         opacities = _sigmoid(col("opacity")) if "opacity" in names else None
         if "scale_0" in names:
-            scales = np.exp(np.stack([col("scale_0"), col("scale_1"),
-                                      col("scale_2")], axis=-1)).mean(axis=1)
+            scales3 = np.exp(np.stack([col("scale_0"), col("scale_1"),
+                                       col("scale_2")], axis=-1))
+            scales = scales3.mean(axis=1)
         else:
             scales = None
+        if "rot_0" in names:
+            quats = np.stack([col("rot_0"), col("rot_1"),
+                              col("rot_2"), col("rot_3")], axis=-1)
+            quats /= (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-12)
     elif "red" in names:                        # plain coloured point cloud
         colors = np.stack([col("red"), col("green"), col("blue")], axis=-1) / 255.0
         scales = opacities = None
     else:                                        # bare xyz
         colors = scales = opacities = None
 
-    return _normalise(means, colors, scales, opacities, n)
+    snap = _normalise(means, colors, scales, opacities, n)
+    snap.scales3, snap.quats = scales3, quats
+    return snap
 
 
 # ---------------------------------------------------------------------------
@@ -204,16 +225,25 @@ class PlySceneSource:
 
 
 class SyntheticSceneSource:
-    """Procedural scene (a coloured sphere shell) — GPU-free viewer smoke tests."""
+    """Procedural scene — GPU-free viewer smoke tests.
+
+    An anisotropic sphere shell: each splat is a flat disc tangent to the sphere
+    (two large axes in the surface, one thin axis along the normal), so it
+    exercises the oriented-ellipse renderer, not just round dots.
+    """
 
     def __init__(self, n: int = 3000, seed: int = 0):
         rng = np.random.default_rng(seed)
         d = rng.standard_normal((n, 3))
         d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
-        self._means = d * (1.0 + 0.05 * rng.standard_normal((n, 1)))
+        self._means = d * (1.0 + 0.02 * rng.standard_normal((n, 1)))
         self._colors = 0.5 + 0.5 * d           # direction → colour
-        self._scales = np.full(n, 0.03)
-        self._opac = np.full(n, 0.85)
+        self._opac = np.full(n, 0.9)
+        # Per-splat: a flat oriented disc tangent to the sphere. z-axis (thin) =
+        # surface normal d; scales = (wide, wide, thin).
+        self._scales3 = np.tile([0.06, 0.06, 0.008], (n, 1)).astype(np.float64)
+        self._quats = _quats_from_normal(d)
+        self._scales = self._scales3.mean(axis=1)
         self._tick = 0
 
     def snapshot(self) -> SceneSnapshot:
@@ -222,7 +252,27 @@ class SyntheticSceneSource:
             self._means.copy(), np.clip(self._colors, 0, 1).copy(),
             self._scales.copy(), self._opac.copy(),
             occupancy=None, stats={"source": "synthetic", "tick": self._tick,
-                                   "count": int(self._means.shape[0])})
+                                   "count": int(self._means.shape[0])},
+            scales3=self._scales3.copy(), quats=self._quats.copy())
+
+
+def _quats_from_normal(normals: np.ndarray) -> np.ndarray:
+    """(N,3) unit normals → (N,4) (w,x,y,z) quats rotating +Z onto each normal."""
+    n = np.asarray(normals, dtype=np.float64)
+    z = np.array([0.0, 0.0, 1.0])
+    out = np.zeros((n.shape[0], 4))
+    for i, tgt in enumerate(n):
+        axis = np.cross(z, tgt)
+        s = np.linalg.norm(axis)
+        c = float(np.dot(z, tgt))
+        if s < 1e-8:                              # parallel or anti-parallel
+            out[i] = [1.0, 0, 0, 0] if c > 0 else [0.0, 1.0, 0.0, 0.0]
+            continue
+        axis /= s
+        ang = np.arctan2(s, c)
+        out[i, 0] = np.cos(ang / 2)
+        out[i, 1:] = axis * np.sin(ang / 2)
+    return out
 
 
 class PipelineSceneSource:
@@ -242,6 +292,10 @@ class PipelineSceneSource:
         if model is not None:
             snap = _normalise(model.means, model.rgb, model.scales,
                               model.alphas, model.num_gaussians)
+            # Real per-splat anisotropy from the optimized Gaussians.
+            snap.scales3 = np.asarray(model.scales, dtype=np.float64)
+            q = np.asarray(model.quats, dtype=np.float64)
+            snap.quats = q / (np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
         else:
             pts = m.latest_gaussians()
             pts = np.zeros((0, 3)) if pts is None else np.asarray(pts, np.float64)

@@ -20,7 +20,7 @@ from viz.scene_source import (  # noqa: E402
     height_colormap,
     read_ply,
 )
-from gaussian.gaussian_model import GaussianModel  # noqa: E402
+from gaussian.gaussian_model import GaussianModel, _logit  # noqa: E402
 from gaussian.finalize import write_ply  # noqa: E402
 
 
@@ -57,6 +57,24 @@ def test_synthetic_source_snapshot():
     assert src.snapshot().stats["tick"] == 2         # ticks advance
 
 
+def test_synthetic_source_is_anisotropic():
+    snap = SyntheticSceneSource(n=200).snapshot()
+    assert snap.anisotropic
+    assert snap.scales3.shape == (200, 3)
+    assert snap.quats.shape == (200, 4)
+    # quaternions are unit-norm
+    assert np.allclose(np.linalg.norm(snap.quats, axis=1), 1.0, atol=1e-9)
+    # discs are flat: one axis much thinner than the other two
+    assert snap.scales3[:, 2].max() < snap.scales3[:, 0].min()
+
+
+def test_decimate_preserves_anisotropy():
+    snap = SyntheticSceneSource(n=100).snapshot().decimated(20)
+    assert snap.count == 20
+    assert snap.scales3.shape == (20, 3)
+    assert snap.quats.shape == (20, 4)
+
+
 def test_ply_roundtrip_recovers_scene():
     rng = np.random.default_rng(1)
     pts = rng.uniform(-1, 1, (200, 3))
@@ -73,6 +91,28 @@ def test_ply_roundtrip_recovers_scene():
     assert np.allclose(snap.colors, rgb, atol=1e-3)      # SH DC round-trip
     assert np.allclose(snap.scales, 0.04, atol=1e-4)     # exp(log_scale)
     assert np.allclose(snap.opacities, 0.3, atol=1e-3)   # sigmoid(logit)
+
+
+def test_ply_roundtrip_recovers_anisotropy():
+    rng = np.random.default_rng(9)
+    n = 50
+    means = rng.uniform(-1, 1, (n, 3))
+    log_scales = np.log(rng.uniform(0.01, 0.2, (n, 3)))   # anisotropic per-axis
+    quats = rng.standard_normal((n, 4))
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+    opac = _logit(np.full(n, 0.5))
+    colors = _logit(np.full((n, 3), 0.5))
+    from gaussian.gaussian_model import GaussianModel as GM
+    model = GM(means, log_scales, quats, opac, colors)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "aniso.ply")
+        write_ply(model, path)
+        snap = read_ply(path)
+
+    assert snap.anisotropic
+    assert np.allclose(snap.scales3, np.exp(log_scales), rtol=1e-3)
+    assert np.allclose(snap.quats, quats, atol=1e-4)      # same normalised orientation
 
 
 def test_ply_source_reads_file():

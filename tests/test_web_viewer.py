@@ -81,6 +81,24 @@ def test_scene_decimation():
         v.stop()
 
 
+def test_scene_endpoint_includes_anisotropy(viewer):
+    # SyntheticSceneSource is anisotropic → scales3 + quats present.
+    scn = _get(viewer.url + "api/scene")
+    n = scn["count"]
+    assert len(scn["scales3"]) == 3 * n
+    assert len(scn["quats"]) == 4 * n
+
+
+def test_scene_endpoint_omits_anisotropy_for_point_cloud():
+    # A snapshot with no scales3/quats (raw cloud) → keys absent.
+    v = WebViewer(_StaticSource(), port=0).start()
+    try:
+        scn = _get(v.url + "api/scene")
+        assert "scales3" not in scn and "quats" not in scn
+    finally:
+        v.stop()
+
+
 def test_stats_endpoint(viewer):
     stats = _get(viewer.url + "api/stats")
     assert stats["source"] == "synthetic"

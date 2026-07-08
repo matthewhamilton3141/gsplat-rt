@@ -57,7 +57,7 @@ _CONTENT_TYPES = {".html": "text/html; charset=utf-8",
 def _scene_json(source, max_points: int) -> dict:
     snap = source.snapshot().decimated(max_points)
     lo, hi = snap.bbox()
-    return {
+    out = {
         "count": snap.count,
         "means": np.round(snap.means, 4).ravel().tolist(),
         "colors": np.round(snap.colors, 3).ravel().tolist(),
@@ -66,6 +66,12 @@ def _scene_json(source, max_points: int) -> dict:
         "bbox": {"min": lo, "max": hi},
         "stats": snap.stats,
     }
+    # Per-splat anisotropy (3-axis scale + orientation) for the ellipse renderer;
+    # absent for a raw point cloud → the viewer draws round discs.
+    if snap.anisotropic:
+        out["scales3"] = np.round(snap.scales3, 4).ravel().tolist()
+        out["quats"] = np.round(snap.quats, 5).ravel().tolist()
+    return out
 
 
 def _occupancy_json(source) -> dict:
