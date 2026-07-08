@@ -262,6 +262,10 @@ class PipelineManager:
         # CUDA-event benchmark in tests/test_depth_inference.py.
         self._depth_ms: deque = deque(maxlen=120)
 
+        # Wall-clock timestamps of recently processed frames, for a rolling FPS
+        # readout (deque.append is GIL-atomic; stats() derives fps from the span).
+        self._frame_times: deque = deque(maxlen=120)
+
         # Gaussian ring buffer — deque.extend is atomic in CPython
         self._gaussian_positions: deque = deque(maxlen=cfg.max_gaussians_export)
         # Parallel per-point source-frame colours (viewer-only; same maxlen so it
@@ -530,11 +534,21 @@ class PipelineManager:
         """
         samples = list(self._depth_ms)   # copy; deque may mutate mid-read
         depth_ms = sum(samples) / len(samples) if samples else 0.0
+
+        # Rolling throughput from the frame-timestamp window.
+        times = list(self._frame_times)
+        fps = 0.0
+        if len(times) >= 2:
+            span = times[-1] - times[0]
+            if span > 0:
+                fps = (len(times) - 1) / span
+
         stats = {
             "frames": self.frames_processed,
             "exports": self.usd_exports,
             "gaussians": len(self._gaussian_positions),
             "depth_ms": depth_ms,
+            "fps": fps,
             "depth_backend": self.depth_backend,
         }
         if self._aligner is not None and self._aligner.params is not None:
@@ -596,6 +610,7 @@ class PipelineManager:
                 continue
 
             self.frames_processed += 1
+            self._frame_times.append(time.monotonic())
 
             # --- Metric scale (relative → metric depth, before any consumer) ---
             if self._aligner is not None:
