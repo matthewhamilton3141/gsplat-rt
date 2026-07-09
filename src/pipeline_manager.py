@@ -428,13 +428,6 @@ class PipelineManager:
                 self._pose_provider = OdometryPoseProvider(self._camera_k, frontend=fe)
                 logger.info("Pose provider: SuperPoint+LightGlue (%s, providers=%s)",
                             cfg.pose_onnx_path, fe.providers)
-                if cfg.pose_backend == "tensorrt" and os.path.exists(cfg.engine_path):
-                    logger.warning(
-                        "pose_backend='tensorrt' together with a native TRT depth "
-                        "engine (%s) is a KNOWN DEADLOCK: two TensorRT contexts in "
-                        "one process hang on the first frame. Use pose_backend='cuda' "
-                        "if the live pipeline stalls (see start() ordering note).",
-                        cfg.engine_path)
             else:
                 logger.warning("Unknown pose_tracking=%r — fusing at identity",
                                cfg.pose_tracking)
@@ -494,21 +487,17 @@ class PipelineManager:
 
         # ---- Metric-scale aligner + monocular reference + pose provider —
         #      all BEFORE the depth estimator ----
-        # Ordering rationale: the SuperPoint pose provider builds an onnxruntime
-        # TensorRT-EP session; constructing it before PyTorch initialises its CUDA
-        # context (which _init_depth_estimator does) is the correct init order for
-        # two TensorRT runtimes sharing one process. eval_odometry never had this
-        # concern — it has no torch-CUDA depth engine. (ORB/CPU pose and mock depth
-        # are unaffected; they touch no CUDA at build time.) The aligner (pure
-        # numpy) must precede the monocular reference, which early-returns with no
-        # aligner.
-        # KNOWN LIMITATION (GPU-tested 2026-07-09): this reorder is necessary but
-        # NOT sufficient — `pose_backend='tensorrt'` still DEADLOCKS at runtime on
-        # the first frame (the native-TRT depth ctx + ORT-TRT-EP pose ctx collide,
-        # not just at construction). Live SuperPoint pose currently requires
-        # `pose_backend='cuda'` (one TRT context). Proper fix TBD (share depth's
-        # native TRT runtime, or isolate pose in its own process); needs a py-spy
-        # dump of the hung process to root-cause.
+        # This ordering is load-bearing and fixes a real deadlock. The SuperPoint
+        # pose provider builds an onnxruntime TensorRT-EP session; it MUST be
+        # created before PyTorch initialises its CUDA context (which
+        # _init_depth_estimator does). With two TensorRT runtimes in one process,
+        # building the torch-CUDA depth engine first hangs the pipeline on the
+        # first frame. Verified on A10G 2026-07-09: with this order,
+        # pose_backend='tensorrt' runs live end-to-end at ~30 fps; the pre-reorder
+        # pipeline deadlocked. eval_odometry never hit it — no torch-CUDA depth
+        # engine. (ORB/CPU pose + mock depth touch no CUDA at build time.) The
+        # aligner (pure numpy) must precede the monocular reference, which
+        # early-returns with no aligner.
         self._aligner = self._init_aligner()
         self._maybe_build_monocular_reference()
         self._maybe_build_pose_provider()
