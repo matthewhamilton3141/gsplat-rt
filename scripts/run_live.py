@@ -15,6 +15,9 @@ Usage:
     python scripts/run_live.py --source 0 --ascii-map
     # a video file, 20 s, into a chosen output dir
     python scripts/run_live.py --source clip.mp4 --duration 20 --output-dir output/run1
+    # SuperPoint+LightGlue pose tracking on a GPU box (TensorRT FP16 front-end)
+    python scripts/run_live.py --source clip.mp4 --pose-tracking superpoint \
+        --pose-backend tensorrt --duration 30
 
 Stops on --duration, when a file source is exhausted, or on Ctrl-C.
 """
@@ -49,6 +52,26 @@ def main() -> int:
     ap.add_argument("--refresh", type=float, default=0.5, help="dashboard refresh period (s)")
     ap.add_argument("--loop", action="store_true", help="rewind a file source at its end (endless source)")
     ap.add_argument("--realtime", action="store_true", help="play a file at its frame rate, not disk speed")
+
+    # --- M6 pose tracking (visual odometry front-end) ---
+    ap.add_argument("--pose-tracking", choices=["none", "orb", "superpoint"], default="none",
+                    help="per-frame pose source: 'none' fuses at identity (fixed camera), "
+                         "'orb' = CPU baseline VO, 'superpoint' = SuperPoint+LightGlue ONNX")
+    ap.add_argument("--pose-backend", choices=["tensorrt", "cuda", "cpu"], default="tensorrt",
+                    help="onnxruntime provider for --pose-tracking superpoint")
+    ap.add_argument("--pose-onnx", default="models/sp_lg_tum.onnx",
+                    help="fused SuperPoint+LightGlue ONNX (for --pose-tracking superpoint); "
+                         "run scripts/export_sp_lg.sh to produce it")
+
+    # --- Monocular metric scale (relative Depth Anything → metric depth) ---
+    ap.add_argument("--metric-scale", action="store_true",
+                    help="align relative depth to a metric scale before fusion")
+    ap.add_argument("--metric-scale-monocular", action="store_true",
+                    help="derive the metric anchor from two-view geometry on the live "
+                         "stream (implies --metric-scale)")
+    ap.add_argument("--metric-scale-anchor", type=float, default=1.0,
+                    help="first-pair baseline in metres pinning absolute scale "
+                         "(1.0 = consistent-but-arbitrary gauge)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -57,17 +80,29 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
+    metric_scale = args.metric_scale or args.metric_scale_monocular
+
     cfg = PipelineConfig(
         video_source=_parse_source(args.source),
         output_dir=args.output_dir,
         usd_update_interval_s=args.interval,
         loop_source=args.loop,
         realtime_source=args.realtime,
+        pose_tracking=args.pose_tracking,
+        pose_backend=args.pose_backend,
+        pose_onnx_path=args.pose_onnx,
+        metric_scale_enabled=metric_scale,
+        metric_scale_monocular=args.metric_scale_monocular,
+        metric_scale_anchor=args.metric_scale_anchor,
     )
 
     manager = PipelineManager(cfg)
     manager.start()
     print(f"\nPipeline started — depth backend: {manager.depth_backend}")
+    if args.pose_tracking != "none":
+        _be = f" ({args.pose_backend})" if args.pose_tracking == "superpoint" else ""
+        print(f"Pose tracking: {args.pose_tracking}{_be}"
+              f"{'  metric-scale: on' if metric_scale else ''}")
     print(f"Outputs → {os.path.abspath(args.output_dir)}")
     print("Press Ctrl-C to stop.\n")
 

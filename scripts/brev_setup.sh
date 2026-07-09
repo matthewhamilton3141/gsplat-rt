@@ -52,9 +52,15 @@ fi
 python3 -m pip install --upgrade pip -q
 python3 -m pip install -r requirements.txt -q
 
-# TensorRT lives on NVIDIA's index, not PyPI's default
+# TensorRT lives on NVIDIA's index, not PyPI's default.
+# PIN TO MAJOR 10: onnxruntime-gpu's TensorRT execution provider is compiled
+# against a specific libnvinfer SONAME. onnxruntime-gpu 1.2x links libnvinfer.so.10
+# (TensorRT 10). An unpinned ">=9.0.0" grabs the newest wheel (TensorRT 11 ->
+# libnvinfer.so.11), which the EP cannot dlopen -- it fails with
+# "libnvinfer.so.10: cannot open shared object file" and silently drops to CUDA.
+# Keep this range aligned with the onnxruntime-gpu pin in requirements.txt.
 log "Installing TensorRT (NGC index)"
-python3 -m pip install "tensorrt>=9.0.0" --extra-index-url https://pypi.ngc.nvidia.com -q
+python3 -m pip install "tensorrt>=10,<11" --extra-index-url https://pypi.ngc.nvidia.com -q
 
 # pxr (OpenUSD) — enables the USD tests instead of mock-only runs
 log "Installing usd-core (pxr)"

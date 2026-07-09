@@ -78,6 +78,31 @@ def test_superpoint_missing_onnx_coasts():
         assert stats["frames"] > 0
 
 
+def test_pose_provider_built_before_depth_estimator():
+    """Load-bearing ordering: the pose provider (onnxruntime TensorRT-EP session)
+    must be constructed BEFORE the torch-CUDA depth estimator. Reversed, two
+    TensorRT runtimes in one process deadlock and the live pipeline hangs on the
+    first frame. This asserts start()'s build order without needing a GPU."""
+    with tempfile.TemporaryDirectory() as tmp:
+        video = os.path.join(tmp, "clip.mp4")
+        _make_video(video, n_frames=10)
+        # superpoint + missing ONNX → pose build is exercised then coasts; mock
+        # depth via the forced-nonexistent engine. Neither touches CUDA on Mac.
+        cfg = _cfg(tmp, video_source=video, pose_tracking="superpoint",
+                   pose_onnx_path="/nonexistent/sp_lg.onnx")
+        pm = PipelineManager(cfg)
+
+        order = []
+        orig_pose, orig_depth = pm._maybe_build_pose_provider, pm._init_depth_estimator
+        pm._maybe_build_pose_provider = lambda: (order.append("pose"), orig_pose())[1]
+        pm._init_depth_estimator = lambda: (order.append("depth"), orig_depth())[1]
+
+        with pm:
+            time.sleep(0.3)
+
+        assert order == ["pose", "depth"], f"pose must precede depth; got {order}"
+
+
 class _FakePairwiseFrontend:
     """Learned-style front-end: presence of match_pair selects the pairwise
     branch; returns arbitrary correspondences and records calls."""

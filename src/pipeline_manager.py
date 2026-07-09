@@ -474,30 +474,41 @@ class PipelineManager:
         )
         self._video_stream.start()
 
-        # ---- Depth estimator ----
-        self._depth_estimator = self._init_depth_estimator()
-
-        # ---- Metric-scale aligner (relative → metric depth) ----
-        self._aligner = self._init_aligner()
-
-        # ---- TSDF collision proxy ----
+        # ---- Camera intrinsics (pure CPU; needed by the pose provider and the
+        #      monocular scale reference, and per-frame for fusion) ----
         from mapping.collision_proxy import (
             CameraIntrinsics, CollisionProxyExtractor, TSDFVolume,
         )
-        tsdf = TSDFVolume(voxel_size=cfg.tsdf_voxel_size, grid_dim=cfg.tsdf_grid_dim)
         self._camera_k = CameraIntrinsics(
             fx=self._fx, fy=self._fy,
             cx=self._cx, cy=self._cy,
             width=cfg.depth_input_w, height=cfg.depth_input_h,
         )
+
+        # ---- Metric-scale aligner + monocular reference + pose provider —
+        #      all BEFORE the depth estimator ----
+        # This ordering is load-bearing and fixes a real deadlock. The SuperPoint
+        # pose provider builds an onnxruntime TensorRT-EP session; it MUST be
+        # created before PyTorch initialises its CUDA context (which
+        # _init_depth_estimator does). With two TensorRT runtimes in one process,
+        # building the torch-CUDA depth engine first hangs the pipeline on the
+        # first frame. Verified on A10G 2026-07-09: with this order,
+        # pose_backend='tensorrt' runs live end-to-end at ~30 fps; the pre-reorder
+        # pipeline deadlocked. eval_odometry never hit it — no torch-CUDA depth
+        # engine. (ORB/CPU pose + mock depth touch no CUDA at build time.) The
+        # aligner (pure numpy) must precede the monocular reference, which
+        # early-returns with no aligner.
+        self._aligner = self._init_aligner()
+        self._maybe_build_monocular_reference()
+        self._maybe_build_pose_provider()
+
+        # ---- Depth estimator (initialises torch CUDA; after the ORT session) ----
+        self._depth_estimator = self._init_depth_estimator()
+
+        # ---- TSDF collision proxy ----
+        tsdf = TSDFVolume(voxel_size=cfg.tsdf_voxel_size, grid_dim=cfg.tsdf_grid_dim)
         self._collision_extractor = CollisionProxyExtractor(tsdf=tsdf, update_hz=10.0)
         self._collision_extractor.start()
-
-        # ---- Monocular scale reference (needs intrinsics, so after _camera_k) ----
-        self._maybe_build_monocular_reference()
-
-        # ---- Pose provider (needs intrinsics; skipped if one was injected) ----
-        self._maybe_build_pose_provider()
 
         # ---- USD bridge ----
         self._init_usd_bridge()
