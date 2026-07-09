@@ -99,6 +99,8 @@ def main() -> int:
     ap.add_argument("--num_scale_frames", type=int, default=8)
     ap.add_argument("--onnx-out", default="/tmp/lingbot_block.onnx")
     ap.add_argument("--opset", type=int, default=18)   # 18+: Split w/ num_outputs (dynamo exporter)
+    ap.add_argument("--bench-torch", type=int, default=0,
+                    help="time the block forward in torch over N runs (per-block baseline)")
     ap.add_argument("--height", type=int, default=392, help="preprocessed H (canonical crop)")
     ap.add_argument("--width", type=int, default=518, help="preprocessed W")
     args = ap.parse_args()
@@ -152,6 +154,25 @@ def main() -> int:
     if "args" not in captured:
         print("ERROR: target was never called during the aggregator forward.")
         return 2
+
+    # Optional PyTorch per-block baseline (bf16, on GPU) — the number TRT beats.
+    if args.bench_torch and device.type == "cuda":
+        with torch.no_grad(), torch.amp.autocast(device.type, dtype=dtype):
+            for _ in range(20):
+                target(*captured["args"], **captured["kwargs"])
+            torch.cuda.synchronize()
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            ts = []
+            for _ in range(args.bench_torch):
+                s.record()
+                target(*captured["args"], **captured["kwargs"])
+                e.record()
+                torch.cuda.synchronize()
+                ts.append(s.elapsed_time(e))
+        ts = np.array(ts)
+        print(f"[torch] block fwd {dtype}: median {np.median(ts):.3f} ms | "
+              f"mean {ts.mean():.3f} ms ({args.bench_torch} runs) — the TRT target")
 
     # Export in fp32 for a clean parity check; TensorRT does its own fp16 later.
     # Cast ONLY floating tensors — integer/index tensors (e.g. RoPE's `pos`, which
