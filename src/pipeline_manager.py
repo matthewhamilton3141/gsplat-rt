@@ -95,7 +95,20 @@ class PipelineConfig:
     """Pixel stride used when sub-sampling depth for Gaussian positions."""
 
     camera_fov_deg: float = 70.0
-    """Symmetric horizontal FOV used for back-projection and TSDF intrinsics."""
+    """Symmetric horizontal FOV used for back-projection and TSDF intrinsics.
+    Only used as a generic guess when camera_intrinsics is None (unknown webcam)."""
+
+    camera_intrinsics: Optional[tuple] = None
+    """(fx, fy, cx, cy) pinhole intrinsics measured at ``camera_intrinsics_hw``.
+    When set, overrides ``camera_fov_deg``: rescaled to the depth-input size so
+    back-projection matches the real camera — and allows fx != fy, which a single
+    FOV cannot (e.g. TUM's 640x480 → 518x518 non-uniform resize). Set this for a
+    known camera / the TUM sequences to get a coherent metric map instead of a
+    geometrically-warped one."""
+
+    camera_intrinsics_hw: Optional[tuple] = None
+    """(height, width) the ``camera_intrinsics`` were measured at, e.g. (480, 640)
+    for TUM. Defaults to the depth-input size when omitted."""
 
     # ---- Offline Gaussian finalize (M5) ----
     optimize_on_finalize: bool = False
@@ -330,11 +343,23 @@ class PipelineManager:
         self._sample_v: np.ndarray = v_idx.ravel()   # (~33×33 = 1089 for 518/16)
         self._sample_u: np.ndarray = u_idx.ravel()
 
-        fov_rad = math.radians(cfg.camera_fov_deg)
-        self._fx: float = (W / 2.0) / math.tan(fov_rad / 2.0)
-        self._fy: float = self._fx
-        self._cx: float = W / 2.0
-        self._cy: float = H / 2.0
+        if cfg.camera_intrinsics is not None:
+            # Real intrinsics, rescaled from their native resolution to the depth
+            # input size — the single space the whole pipeline back-projects in
+            # (OdometryPoseProvider resizes frames to depth resolution). Non-uniform
+            # scale preserves fx != fy, which a single FOV cannot express.
+            fx, fy, cx, cy = cfg.camera_intrinsics
+            nh, nw = cfg.camera_intrinsics_hw or (H, W)
+            sx, sy = W / float(nw), H / float(nh)
+            fx_d, fy_d, cx_d, cy_d = fx * sx, fy * sy, cx * sx, cy * sy
+        else:
+            fov_rad = math.radians(cfg.camera_fov_deg)
+            fx_d = fy_d = (W / 2.0) / math.tan(fov_rad / 2.0)
+            cx_d, cy_d = W / 2.0, H / 2.0
+        self._fx: float = fx_d
+        self._fy: float = fy_d
+        self._cx: float = cx_d
+        self._cy: float = cy_d
 
     def _init_depth_estimator(self):
         """Return a real TRT DepthEstimator if CUDA + engine are present, else mock."""
