@@ -24,7 +24,7 @@ A single video stream (webcam or file) enters the pipeline. Concurrent stages tr
 3. **Camera tracking (optional)** — an RGB-D visual-odometry front-end (ORB baseline, or a learned SuperPoint + LightGlue front-end) supplies a per-frame camera pose, so geometry fuses coherently in a world frame instead of at a fixed camera.
 4. **Geometry extraction** — depth maps are fused into a TSDF volume (**custom CUDA kernel, 0.06 ms/frame**, numpy fallback) at 10 Hz; marching cubes extracts a coarse collision mesh in a background thread.
 5. **USD export** — a `.usdz` stage is written periodically containing a `ParticleField` Gaussian Splat layer for NuRec rendering and an invisible `UsdGeom.Mesh` collision proxy with `UsdPhysics.CollisionAPI` for PhysX.
-6. **2-D previews** — alongside each export, two glanceable PNGs are written so you can eyeball a run without a USD viewer: a top-down **occupancy map** (floor plan from the TSDF) and a depth-colored **splat preview** (the point cloud projected through the camera). These need only numpy + OpenCV, so they render even when `pxr` and CUDA are absent.
+6. **2-D previews** — alongside each export, three glanceable PNGs are written so you can eyeball a run without a USD viewer: a top-down **occupancy map** (floor plan from the TSDF), a **points preview** (crisp dots), and a **splat preview** (soft alpha-composited Gaussian blobs). Both cloud previews **auto-frame** the scene (fit a virtual camera to its extent) and **auto-upright** it (RANSAC dominant-plane + mean-camera-up hint), coloured by real per-splat RGB — so a moving, world-space reconstruction reads correctly instead of landing tilted in a corner. These need only numpy + OpenCV, so they render even when `pxr` and CUDA are absent.
 
 ## Architecture
 
@@ -148,6 +148,15 @@ python scripts/run_viewer.py --demo              # procedural scene, no GPU/pipe
 
 Then open **http://localhost:8000**. Gaussians with real shape (optimized splats or a `.ply`) render as **anisotropic oriented ellipses**; a raw point cloud falls back to soft round discs — press **`A`** to compare. Splats are coloured per-splat (from the optimizer or the live source frame) or by height, with the top-down occupancy map and live stats (FPS, depth latency, splat count, metric scale) in overlays. Procedural demo shapes: `--scene sphere|plane|axes`. The backend is **pure stdlib** (`http.server` + numpy — no new dependencies); the page pulls Three.js from a CDN. It only *reads* the pipeline via `latest_gaussians()` / `latest_occupancy()` / `stats()`, so it's fully decoupled from the hot path and never perturbs throughput. Works GPU-free (mock depth), so you can demo the whole thing on a laptop.
 
+For a heavier orbit-able view built on **[viser](https://github.com/nerfstudio-project/viser)** (the NeRF/3DGS-ecosystem viewer — real orbit/pan/zoom, ground grid, camera-frustum trajectory), with the same auto-upright logic as the PNG previews:
+
+```bash
+python scripts/view_scene.py --ply output/live_scene.ply   # a finalize .ply
+python scripts/view_scene.py --demo                        # synthetic, no GPU
+```
+
+viser is an optional, lazy-imported dependency (`pip install viser`); the core pipeline never needs it.
+
 ### Step 3c — camera tracking (SLAM front-end)
 
 Score the visual-odometry front-ends on a TUM sequence (ATE + trajectory render), or turn a tracker on in the live pipeline:
@@ -228,6 +237,7 @@ gsplat-rt/
 │   ├── viz/
 │   │   ├── scene_source.py       # pipeline/.ply/synthetic → SceneSnapshot (+ PLY reader)
 │   │   ├── web_viewer.py         # stdlib ThreadingHTTPServer + JSON scene feed
+│   │   ├── viser_viewer.py       # viser 3-D viewer (upright, orbit-able) — optional dep
 │   │   └── static/               # Three.js SPA (index.html + viewer.js)
 │   └── pipeline_manager.py       # central orchestrator (depth, scale, pose, TSDF, USD)
 ├── kernels/
@@ -235,6 +245,8 @@ gsplat-rt/
 ├── scripts/
 │   ├── run_live.py               # run + watch live (dashboard + ASCII map)
 │   ├── run_viewer.py             # live 3-D browser viewer (splats + occupancy)
+│   ├── view_scene.py             # viser viewer entry (--ply / --demo)
+│   ├── lingbot_trt/              # LingBot-Map → TensorRT study (export + build/bench + RESULTS.md)
 │   ├── bench_pipeline.py         # per-stage latency + FPS benchmark
 │   ├── bench_depth.py            # TF32 vs FP16 depth latency + fidelity
 │   ├── bench_tsdf.py             # numpy vs CUDA TSDF integrate speed-up
@@ -307,14 +319,19 @@ Five of these are **built and measured on the A10G**; only M7 remains ahead. Eac
   |:---:|:---:|
   | ![ORB visual-odometry trajectory](docs/odometry_orb.png) | ![SuperPoint+LightGlue visual-odometry trajectory](docs/odometry_superpoint_lightglue.png) |
 
-  Run either with `scripts/eval_odometry.py --frontend {orb,superpoint}` (add `--provider tensorrt` for the compiled engine). A **TensorRT FP16 engine** takes the learned front-end from 132 ms/frame (onnxruntime CUDA) to **7.4 ms/frame** — an 18× speed-up, well inside the real-time budget — while preserving accuracy (**3.5 cm ATE via TRT vs 3.6 cm via onnxruntime**; FP16 leaves match quality intact). It is wired into the live pipeline via `PipelineConfig.pose_tracking="superpoint"`. Next: GPU end-to-end verification of the live tracked pipeline, keyframing / loop closure, and folding the monocular metric-scale stage into the live mono-depth tracking path.
+  Run either with `scripts/eval_odometry.py --frontend {orb,superpoint}` (add `--provider tensorrt` for the compiled engine). A **TensorRT FP16 engine** takes the learned front-end from 132 ms/frame (onnxruntime CUDA) to **7.4 ms/frame** — an 18× speed-up, well inside the real-time budget — while preserving accuracy (**3.5 cm ATE via TRT vs 3.6 cm via onnxruntime**; FP16 leaves match quality intact). It is wired into the live pipeline via `PipelineConfig.pose_tracking="superpoint"`, and the **full live tracked pipeline (FP16 depth + SuperPoint+LightGlue TRT pose + TSDF) sustains ~30 FPS on the A10G** (GPU-verified end-to-end). **Live map coherence** is closed: `run_live --tum-intrinsics --metric-scale-monocular` feeds real source intrinsics (`fx≠fy`, rescaled to depth space) + cross-frame metric scale, and with the upright auto-framed previews the live TUM map renders a recognizable, colored desk instead of an origin blob. Remaining: keyframing / loop closure (the real fix for full-trajectory monocular drift).
 - **M5 — Gaussian optimizer** — *built + wired into the pipeline*: a differentiable EWA-splatting rasterizer with hand-derived analytic gradients (verified against finite differences to <1e-4) and a numpy Adam loop (`src/gaussian/`). Fits posed views to >60 dB PSNR at ~2 ms/iter on CPU; ports to CUDA/torch on the A10G unchanged. The pipeline now runs it as an **offline finalize stage** (`optimize_on_finalize`): the hot path stashes RGB keyframes + poses, and `stop()` seeds Gaussians from the fused point cloud, fits them against the keyframes, and exports optimized splats as a 3DGS `.ply` — kept off the 30 FPS path since pure-numpy is too slow per frame. The loss is the **full 3DGS photometric loss** `(1−λ)·L1 + λ·(1−SSIM)` (`src/gaussian/ssim.py`): an 11×11 Gaussian-window SSIM with a hand-derived **analytic D-SSIM gradient** (self-adjoint zero-padded filter → exact adjoint; matches finite differences to <1e-5), wired via `finalize_ssim_weight` (default 0.2, the paper value). **Adaptive Density Control** (`src/gaussian/densify.py`) is implemented too: the backward pass surfaces the view-space position gradient + visibility, and the controller **clones** small under-reconstructed Gaussians (nudged along −∇means), **splits** large ones into children sampled from their own 3-D covariance (÷1.6), and **prunes** transparent ones — resizing the Adam moments in lock-step (persisting Gaussians keep their momentum, children start fresh). Opt-in via `finalize_densify`; a fit seeded with a single Gaussian grows itself to reconstruct a multi-Gaussian target. Next: SH view-dependent colour and a CUDA/torch fit fast enough to run online.
+
+### Exploration — LingBot-Map → TensorRT
+
+A separate optimization study (`scripts/lingbot_trt/`, full writeup in [`RESULTS.md`](scripts/lingbot_trt/RESULTS.md)): taking [LingBot-Map](https://github.com/Robbyant/lingbot-map) — a VGGT-style feed-forward streaming 3D-reconstruction foundation model — and making it faster on the A10G via ONNX export + TensorRT. Measured, for one aggregator frame block: PyTorch bf16 **9.23 ms → TensorRT FP16 5.25 ms (1.76×)**, ONNX export parity 7.6e-6. INT8 was measured too and **did not pay off** (TRT fell back to fp16 — implicit calibration is deprecated, and the block is memory-bound; fp16 is the sweet spot) — an honest negative result documented alongside the win. Key finding: FlashInfer is optional (every attention path has an SDPA fallback), so no custom-kernel export is needed. Not integrated end-to-end; the stateful KV-cache global blocks remain the hard win.
 
 ### Next
 
 - **M7 — Isaac Sim live reload** — hot-swap the `.usdz` stage in Omniverse as new geometry arrives, without restarting the simulation.
-- **M6 tail** — GPU end-to-end verification of the live SuperPoint+LightGlue tracked pipeline, keyframing / loop closure, and metric-scale in the live mono-depth tracking path.
+- **M6 tail** — keyframing / loop closure (the real fix for full-trajectory monocular drift).
 - **M5 tail** — SH view-dependent colour and an online CUDA/torch Gaussian fit.
+- **LingBot-Map** — end-to-end TensorRT integration (whole-model fps) and the KV-cache global blocks.
 
 ## License
 
