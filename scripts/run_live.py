@@ -52,6 +52,9 @@ def main() -> int:
     ap.add_argument("--refresh", type=float, default=0.5, help="dashboard refresh period (s)")
     ap.add_argument("--loop", action="store_true", help="rewind a file source at its end (endless source)")
     ap.add_argument("--realtime", action="store_true", help="play a file at its frame rate, not disk speed")
+    ap.add_argument("--max-splats", type=int, default=150_000,
+                    help="ring-buffer cap on accumulated splat centres — how much "
+                         "of a moving trajectory the previews/USD retain (default 150k)")
 
     # --- M6 pose tracking (visual odometry front-end) ---
     ap.add_argument("--pose-tracking", choices=["none", "orb", "superpoint"], default="none",
@@ -72,7 +75,34 @@ def main() -> int:
     ap.add_argument("--metric-scale-anchor", type=float, default=1.0,
                     help="first-pair baseline in metres pinning absolute scale "
                          "(1.0 = consistent-but-arbitrary gauge)")
+
+    # --- Camera intrinsics (a coherent metric map needs the real camera model;
+    #     without these run_live falls back to a generic FOV guess) ---
+    ap.add_argument("--tum-intrinsics", action="store_true",
+                    help="use TUM freiburg1 intrinsics (fx=517.31 fy=516.47 "
+                         "cx=318.64 cy=255.31 @ 640x480) — for the TUM RGB clips")
+    ap.add_argument("--camera-fx", type=float, help="focal-x, with --camera-fy/cx/cy + --camera-native-hw")
+    ap.add_argument("--camera-fy", type=float, help="focal-y")
+    ap.add_argument("--camera-cx", type=float, help="principal-point x")
+    ap.add_argument("--camera-cy", type=float, help="principal-point y")
+    ap.add_argument("--camera-native-hw", type=int, nargs=2, metavar=("H", "W"),
+                    help="pixel resolution the --camera-* intrinsics were measured at")
     args = ap.parse_args()
+
+    # Resolve intrinsics: --tum-intrinsics preset, or a full custom set, or None
+    # (generic FOV fallback in PipelineManager).
+    cam_intr = cam_hw = None
+    if args.tum_intrinsics:
+        cam_intr = (517.306408, 516.469215, 318.643040, 255.313989)
+        cam_hw = (480, 640)
+    elif any(v is not None for v in
+             (args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy)):
+        if (any(v is None for v in
+                (args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy))
+                or args.camera_native_hw is None):
+            ap.error("--camera-fx/fy/cx/cy and --camera-native-hw must be given together")
+        cam_intr = (args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy)
+        cam_hw = tuple(args.camera_native_hw)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -94,6 +124,9 @@ def main() -> int:
         metric_scale_enabled=metric_scale,
         metric_scale_monocular=args.metric_scale_monocular,
         metric_scale_anchor=args.metric_scale_anchor,
+        camera_intrinsics=cam_intr,
+        camera_intrinsics_hw=cam_hw,
+        max_gaussians_export=args.max_splats,
     )
 
     manager = PipelineManager(cfg)
@@ -103,6 +136,13 @@ def main() -> int:
         _be = f" ({args.pose_backend})" if args.pose_tracking == "superpoint" else ""
         print(f"Pose tracking: {args.pose_tracking}{_be}"
               f"{'  metric-scale: on' if metric_scale else ''}")
+    if cam_intr is not None:
+        src = "TUM fr1" if args.tum_intrinsics else "custom"
+        print(f"Camera intrinsics: {src}  fx={cam_intr[0]:.1f} fy={cam_intr[1]:.1f} "
+              f"cx={cam_intr[2]:.1f} cy={cam_intr[3]:.1f} @ {cam_hw[1]}x{cam_hw[0]}")
+    else:
+        print(f"Camera intrinsics: generic FOV {cfg.camera_fov_deg:.0f}° "
+              "(no --tum-intrinsics/--camera-*; map geometry approximate)")
     print(f"Outputs → {os.path.abspath(args.output_dir)}")
     print("Press Ctrl-C to stop.\n")
 
@@ -163,7 +203,8 @@ def main() -> int:
     print(f"\nDone. frames={s['frames']} exports={s['exports']} "
           f"splats={s['gaussians']} depth~{s['depth_ms']:.1f}ms")
     print("Wrote:")
-    for p in (manager.usdz_path, manager.occupancy_png_path, manager.preview_png_path):
+    for p in (manager.usdz_path, manager.occupancy_png_path,
+              manager.preview_png_path, manager.points_png_path):
         mark = "✓" if p and os.path.exists(p) else "·"
         print(f"  {mark} {p}")
     return 0

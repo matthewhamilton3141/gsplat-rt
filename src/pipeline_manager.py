@@ -78,8 +78,13 @@ class PipelineConfig:
     realtime_source: bool = False
     """Pace a file source to its frame rate instead of reading at disk speed."""
 
-    max_gaussians_export: int = 5_000
-    """Maximum Gaussian splat centres kept in the ring buffer."""
+    max_gaussians_export: int = 150_000
+    """Maximum Gaussian splat centres kept in the ring buffer. This is a ring:
+    once full it evicts the oldest points, so it also sets how much of a moving
+    trajectory the previews/USD accumulate. At 5k it held only ~4 frames of a
+    16-stride 518² sub-sample (~1089 pts/frame) — a moving camera then showed just
+    the latest sliver. 150k keeps ~130 frames, enough for a full desk sweep; the
+    previews decimate for render speed so the buffer size doesn't slow them."""
 
     tsdf_voxel_size: float = 0.05
     """TSDF voxel edge length in metres."""
@@ -95,7 +100,20 @@ class PipelineConfig:
     """Pixel stride used when sub-sampling depth for Gaussian positions."""
 
     camera_fov_deg: float = 70.0
-    """Symmetric horizontal FOV used for back-projection and TSDF intrinsics."""
+    """Symmetric horizontal FOV used for back-projection and TSDF intrinsics.
+    Only used as a generic guess when camera_intrinsics is None (unknown webcam)."""
+
+    camera_intrinsics: Optional[tuple] = None
+    """(fx, fy, cx, cy) pinhole intrinsics measured at ``camera_intrinsics_hw``.
+    When set, overrides ``camera_fov_deg``: rescaled to the depth-input size so
+    back-projection matches the real camera — and allows fx != fy, which a single
+    FOV cannot (e.g. TUM's 640x480 → 518x518 non-uniform resize). Set this for a
+    known camera / the TUM sequences to get a coherent metric map instead of a
+    geometrically-warped one."""
+
+    camera_intrinsics_hw: Optional[tuple] = None
+    """(height, width) the ``camera_intrinsics`` were measured at, e.g. (480, 640)
+    for TUM. Defaults to the depth-input size when omitted."""
 
     # ---- Offline Gaussian finalize (M5) ----
     optimize_on_finalize: bool = False
@@ -306,6 +324,7 @@ class PipelineManager:
         self.usdz_path: str = ""
         self.occupancy_png_path: str = ""
         self.preview_png_path: str = ""
+        self.points_png_path: str = ""
         self.ply_path: str = ""
 
     # ------------------------------------------------------------------
@@ -330,11 +349,23 @@ class PipelineManager:
         self._sample_v: np.ndarray = v_idx.ravel()   # (~33×33 = 1089 for 518/16)
         self._sample_u: np.ndarray = u_idx.ravel()
 
-        fov_rad = math.radians(cfg.camera_fov_deg)
-        self._fx: float = (W / 2.0) / math.tan(fov_rad / 2.0)
-        self._fy: float = self._fx
-        self._cx: float = W / 2.0
-        self._cy: float = H / 2.0
+        if cfg.camera_intrinsics is not None:
+            # Real intrinsics, rescaled from their native resolution to the depth
+            # input size — the single space the whole pipeline back-projects in
+            # (OdometryPoseProvider resizes frames to depth resolution). Non-uniform
+            # scale preserves fx != fy, which a single FOV cannot express.
+            fx, fy, cx, cy = cfg.camera_intrinsics
+            nh, nw = cfg.camera_intrinsics_hw or (H, W)
+            sx, sy = W / float(nw), H / float(nh)
+            fx_d, fy_d, cx_d, cy_d = fx * sx, fy * sy, cx * sx, cy * sy
+        else:
+            fov_rad = math.radians(cfg.camera_fov_deg)
+            fx_d = fy_d = (W / 2.0) / math.tan(fov_rad / 2.0)
+            cx_d, cy_d = W / 2.0, H / 2.0
+        self._fx: float = fx_d
+        self._fy: float = fy_d
+        self._cx: float = cx_d
+        self._cy: float = cy_d
 
     def _init_depth_estimator(self):
         """Return a real TRT DepthEstimator if CUDA + engine are present, else mock."""
@@ -461,6 +492,7 @@ class PipelineManager:
         self.usdz_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.usdz")
         self.occupancy_png_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_occupancy.png")
         self.preview_png_path   = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_splat_preview.png")
+        self.points_png_path    = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_points_preview.png")
         self.ply_path           = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.ply")
 
         logger.info("PipelineManager starting — output: %s", cfg.output_dir)
@@ -893,6 +925,23 @@ class PipelineManager:
             logger.exception("PLY write failed")
         return True
 
+    def _mean_camera_up(self) -> Optional[np.ndarray]:
+        """Mean camera-up over the keyframe trajectory, for upright previews.
+
+        Each keyframe pose is a 4x4 camera-to-world; the camera's up in world is
+        ``-R[:, 1]`` (OpenCV convention, +Y down). Averaging over the trajectory
+        gives the preview a stable 'which way is up' hint (see
+        ``visualization.estimate_up``). Returns None when no posed keyframes exist
+        (fixed-camera runs) so the preview falls back to point-only estimation.
+        """
+        ups = [-np.asarray(pose)[:3, 1] for _rgb, pose in list(self._keyframes)
+               if pose is not None]
+        if not ups:
+            return None
+        u = np.mean(ups, axis=0)
+        n = np.linalg.norm(u)
+        return None if n < 1e-9 else (u / n)
+
     def _write_previews(self) -> None:
         """Write the 2-D occupancy map + splat preview PNGs.
 
@@ -903,28 +952,34 @@ class PipelineManager:
         if not self._config.write_previews:
             return
         try:
-            from mapping.visualization import save_occupancy_png, save_splat_preview
+            from mapping.visualization import (save_occupancy_png,
+                                               save_points_preview,
+                                               save_splat_preview)
         except ImportError:
             return
 
         try:
             grid = self._collision_extractor.get_latest_occupancy()
             if grid is not None:
-                save_occupancy_png(grid, self.occupancy_png_path)
+                save_occupancy_png(grid, self.occupancy_png_path, crop=True)
         except Exception:
             logger.exception("Occupancy PNG write failed")
 
         try:
-            positions = list(self._gaussian_positions)
+            positions = list(self._gaussian_positions)     # snapshot the deque
+            colors = list(self._gaussian_colors)           # parallel, may lag
+            # Only pair colours when they line up 1:1 with positions (the deques
+            # can be mid-extend); otherwise fall back to the depth ramp.
+            cols = colors if len(colors) == len(positions) else None
+            cam_up = self._mean_camera_up()                # upright hint, or None
             if positions:
-                save_splat_preview(
-                    positions,
-                    self._fx, self._fy, self._cx, self._cy,
-                    self._config.depth_input_w, self._config.depth_input_h,
-                    self.preview_png_path,
-                )
+                w, h = self._config.depth_input_w, self._config.depth_input_h
+                save_points_preview(positions, self.points_png_path,
+                                    width=w, height=h, colors=cols, cam_up=cam_up)
+                save_splat_preview(positions, self.preview_png_path,
+                                   width=w, height=h, colors=cols, cam_up=cam_up)
         except Exception:
-            logger.exception("Splat preview write failed")
+            logger.exception("Preview PNG write failed")
 
     def _splat_export_arrays(self):
         """Assemble (means, scales, rotations, opacities, sh_coeffs) for USD.

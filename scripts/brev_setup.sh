@@ -66,6 +66,14 @@ python3 -m pip install "tensorrt>=10,<11" --extra-index-url https://pypi.ngc.nvi
 log "Installing usd-core (pxr)"
 python3 -m pip install usd-core -q
 
+# ffmpeg — run_live drives a cv2.VideoCapture source, so image-sequence datasets
+# (TUM's timestamp-named PNGs) must be packed into an mp4 first. Not a pip dep.
+if ! command -v ffmpeg >/dev/null; then
+    log "Installing ffmpeg (apt)"
+    sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg \
+        || log "WARNING: ffmpeg install failed — pack TUM PNGs to mp4 manually before run_live"
+fi
+
 python3 - <<'EOF'
 import torch, tensorrt
 from pxr import Usd
