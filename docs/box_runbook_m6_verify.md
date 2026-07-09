@@ -97,12 +97,36 @@ What we need to record (and only then put in README/memory):
 
 Correct any doc number **down** to what the box shows — never assume.
 
-## Optional: live monocular metric scale (M6 remaining item #3)
+## NEXT RUN: map-coherence verify (intrinsics + metric scale)
 
-Exercises the relative→metric aligner on the live stream:
+Status after 2026-07-09: the TensorRT pose path runs live end-to-end at ~30 fps
+(verified), but the live TUM *map* was NOISE — `run_live` used a generic FOV
+camera (forcing fx==fy) on TUM's 640x480→518x518 non-uniform resize, and depth is
+monocular/relative. Two fixes now exist to try together:
+- `--tum-intrinsics` — real freiburg1 intrinsics, rescaled to depth space (fx!=fy).
+- `--metric-scale-monocular` — cross-frame scale consistency for relative depth.
+
+Requires branch **feat/run-live-source-intrinsics** (the intrinsics flags aren't
+on main yet). On a fresh box, checkout it BEFORE `brev_setup.sh`:
+```bash
+git clone https://github.com/matthewhamilton3141/gsplat-rt.git ~/gsplat-rt
+cd ~/gsplat-rt && git checkout feat/run-live-source-intrinsics
+bash scripts/brev_setup.sh    # main has the tensorrt<11 pin; now also installs ffmpeg
+```
+Then (after export_sp_lg.sh + the ffmpeg pack from section 2; LD_LIBRARY_PATH set):
 ```bash
 python3.10 scripts/run_live.py --source /tmp/tum_fr1_desk.mp4 \
-    --pose-tracking superpoint --pose-backend tensorrt \
-    --metric-scale-monocular --duration 30
-# expect log: "Monocular scale reference active (anchor=1.000)"
+    --pose-tracking superpoint --pose-backend tensorrt --pose-onnx models/sp_lg_tum.onnx \
+    --tum-intrinsics --metric-scale-monocular \
+    --realtime --loop --duration 30
+# banner must show: "Camera intrinsics: TUM fr1 ..." and "Monocular scale reference active"
 ```
+PASS = `output/live_scene_occupancy.png` / `_splat_preview.png` show a coherent
+desk scene (view in Jupyter file browser), not the origin-blob/noise from before.
+If still noisy, the residual is monocular-depth scale drift — fall back to
+`scripts/reconstruct_tum.py` (real depth + real intrinsics) for a clean visual.
+
+Reminders that cost time tonight: use **`python3.10`** (brev's bare python3 lacks
+deps); run inside **tmux** (SSH drops); **don't kill a run early** — first-frame
+TRT-engine build/warmup can look frozen for 60-90s; drop **`--ascii-map`** in a
+Jupyter terminal (ANSI clears don't render — looks hung).
