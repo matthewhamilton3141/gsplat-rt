@@ -98,7 +98,7 @@ def main() -> int:
     ap.add_argument("--patch_size", type=int, default=14)
     ap.add_argument("--num_scale_frames", type=int, default=8)
     ap.add_argument("--onnx-out", default="/tmp/lingbot_block.onnx")
-    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--opset", type=int, default=18)   # 18+: Split w/ num_outputs (dynamo exporter)
     ap.add_argument("--height", type=int, default=392, help="preprocessed H (canonical crop)")
     ap.add_argument("--width", type=int, default=518, help="preprocessed W")
     args = ap.parse_args()
