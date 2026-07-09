@@ -95,18 +95,37 @@ def save_occupancy_png(
     return path
 
 
-def _decimate(
+def _prep_points(
     points: Sequence[Sequence[float]],
     colors: Optional[Sequence[Sequence[float]]],
     max_points: int,
+    reject_outliers: bool = True,
+    mad_k: float = 6.0,
 ):
-    """Cap the drawn point count so a large accumulation buffer stays fast to
-    render. Uniform random subsample (fixed seed → stable across export ticks),
-    keeping ``colors`` in lockstep. Returns ``(pts, colors)`` as arrays."""
+    """Prepare a cloud for preview: drop stray outliers, then cap the count.
+
+    Outlier rejection is a robust MAD gate on distance-from-median — it clears
+    the floating specks that back-projection throws off (bad depth / pose blips)
+    which otherwise both clutter the image and drag the auto-frame off the main
+    body. Then a uniform random subsample (fixed seed → stable across export
+    ticks) caps the drawn count so a large accumulation buffer stays fast to
+    render. ``colors`` is kept in lockstep throughout. Returns ``(pts, colors)``.
+    """
     pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
     col = None if colors is None else np.asarray(colors, dtype=np.float32).reshape(-1, 3)
     if col is not None and col.shape[0] != pts.shape[0]:
         col = None                                   # misaligned → drop, use ramp
+
+    if reject_outliers and pts.shape[0] >= 20:
+        centre = np.median(pts, axis=0)
+        d = np.linalg.norm(pts - centre, axis=1)
+        med = float(np.median(d))
+        mad = float(np.median(np.abs(d - med))) + 1e-6
+        keep = d <= med + mad_k * mad
+        if int(keep.sum()) >= 10:                    # never nuke the whole cloud
+            pts = pts[keep]
+            col = None if col is None else col[keep]
+
     if max_points and pts.shape[0] > max_points:
         idx = np.random.default_rng(0).choice(pts.shape[0], max_points, replace=False)
         pts = pts[idx]
@@ -209,7 +228,7 @@ def save_points_preview(
     max_points : int
         Subsample to at most this many points before drawing (render speed).
     """
-    points, colors = _decimate(points, colors, max_points)
+    points, colors = _prep_points(points, colors, max_points)
     proj = _auto_frame_project(points, width, height)
     if proj is None:
         return None
@@ -261,7 +280,7 @@ def save_splat_preview(
     max_points : int
         Subsample to at most this many points before drawing (render speed).
     """
-    points, colors = _decimate(points, colors, max_points)
+    points, colors = _prep_points(points, colors, max_points)
     proj = _auto_frame_project(points, width, height)
     if proj is None:
         return None

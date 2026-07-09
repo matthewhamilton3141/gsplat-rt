@@ -165,6 +165,36 @@ def test_splat_preview_uses_supplied_colors():
         assert drawn[:, 2].mean() > drawn[:, 1].mean() + 40
 
 
+def test_prep_points_rejects_outliers():
+    """The MAD gate drops far-flung specks but keeps the whole main body."""
+    from mapping.visualization import _prep_points
+
+    rng = np.random.default_rng(2)
+    body = rng.normal(0, 0.5, (5000, 3)).astype(np.float32) + [10, -5, 20]
+    stray = rng.uniform(0, 1, (50, 3)).astype(np.float32) + [40, 40, 60]  # far cluster
+    cloud = np.vstack([body, stray])
+    kept, _ = _prep_points(cloud, None, max_points=0, reject_outliers=True)
+    assert body.shape[0] <= kept.shape[0] < cloud.shape[0]     # stray gone, body intact
+    # every kept point is near the body centroid, none out at the stray cluster
+    assert np.linalg.norm(kept - np.median(body, axis=0), axis=1).max() < 20.0
+
+
+def test_outliers_do_not_pull_the_frame():
+    """A stray cluster must not drag the auto-frame off the main body: the drawn
+    content stays centred once outliers are rejected."""
+    rng = np.random.default_rng(5)
+    body = rng.normal(0, 0.4, (4000, 3)).astype(np.float32) + [10, -5, 20]
+    stray = rng.uniform(0, 0.5, (300, 3)).astype(np.float32) + [25, 10, 22]
+    cloud = np.vstack([body, stray])
+    with tempfile.TemporaryDirectory() as d:
+        path = save_points_preview(cloud, os.path.join(d, "c.png"),
+                                   width=256, height=256)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        drawn = np.argwhere(img > 30)
+        cy, cx = drawn.mean(axis=0)
+        assert 80 < cx < 176 and 80 < cy < 176      # centred, not shoved aside
+
+
 def test_previews_empty_returns_none():
     with tempfile.TemporaryDirectory() as d:
         empty = np.empty((0, 3), np.float32)
