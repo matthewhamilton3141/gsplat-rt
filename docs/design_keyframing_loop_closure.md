@@ -1,6 +1,8 @@
 # Design note — keyframing & loop closure for the SLAM front-end
 
-Status: **design only, not implemented.** Prep for M6 remaining item #2.
+Status: **Stage 1 implemented** (keyframing + frame-to-keyframe tracking, opt-in,
+ORB default, Mac-tested — `tests/test_keyframe_odometry.py`). Stages 2–3 (loop
+detection, pose-graph optimisation) remain. Prep for M6 remaining item #2.
 
 ## Why
 
@@ -22,15 +24,18 @@ live walk-around the map will smear when the camera revisits a place. Keyframing
 
 ## Proposed staging (smallest useful first)
 
-### Stage 1 — Keyframe selection (no optimisation yet)
+### Stage 1 — Keyframe selection (no optimisation yet) — ✅ DONE
 A cheap, standalone win that also cuts front-end cost.
-- Add a `KeyframeDB`: stores `(id, pose, keypoints, descriptors, depth_thumb)`.
-- Insert a keyframe when any of: translation since last KF > τ_t (e.g. 10 cm),
-  rotation > τ_r (e.g. 10°), or tracked-inlier ratio drops below a floor.
-- Track new frames against the **current keyframe** (frame-to-keyframe), not the
-  immediately previous frame — reduces short-term drift and is cheaper for the
-  fused SuperPoint ONNX (extract KF once, reuse).
-- Testable on Mac with synthetic poses; no GPU needed.
+- `KeyframeDB` + `Keyframe(id, pose, depth, xy/des or rgb)` in `rgbd_odometry.py`.
+- `RGBDOdometry(..., keyframe=True, kf_trans_thresh=0.10, kf_rot_thresh_deg=10,
+  kf_min_inlier_ratio=0.5)`: inserts a keyframe when a well-tracked frame moves past
+  the translation/rotation threshold or its inlier ratio drops below the floor.
+- Tracks each frame against the **current keyframe** (`_track_keyframe`), for both
+  front-end kinds (detect/match caches keypoints+descriptors; pairwise caches rgb).
+  `OdometryPoseProvider(**kwargs)` already threads `keyframe=True` through.
+- Opt-in: `keyframe=False` is the untouched, byte-identical frame-to-frame baseline.
+- Mac-tested on a synthetic scene (`tests/test_keyframe_odometry.py`, 4 tests):
+  DB semantics, KF0, insertion-as-camera-moves + trajectory tracks GT, off ⇒ no KFs.
 
 ### Stage 2 — Loop detection
 - **ORB path:** bag-of-words (DBoW2-style) over ORB descriptors, or a simple

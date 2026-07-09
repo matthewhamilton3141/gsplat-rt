@@ -44,12 +44,46 @@ def _invert_se3(T: np.ndarray) -> np.ndarray:
     return Ti
 
 
+def _rotation_angle(R: np.ndarray) -> float:
+    """Geodesic rotation angle (radians) of a 3x3 rotation matrix."""
+    return float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
+
+
 @dataclass
 class TrackResult:
     pose: np.ndarray            # (4,4) camera-to-world
     n_matches: int              # descriptor matches this step
     n_inliers: int              # PnP RANSAC inliers (0 if PnP skipped/failed)
     ok: bool                    # True if a pose was estimated (not a fallback)
+
+
+@dataclass
+class Keyframe:
+    """One keyframe: a re-usable tracking anchor (Stage 1 of loop closure)."""
+    id: int
+    pose: np.ndarray                        # (4,4) camera-to-world
+    depth: np.ndarray                       # metric depth, for back-projection
+    xy: Optional[np.ndarray] = None         # keypoints (detect/match front-ends)
+    des: Optional[object] = None            # descriptors (detect/match front-ends)
+    rgb: Optional[np.ndarray] = None        # raw frame (pairwise match_pair front-ends)
+
+
+class KeyframeDB:
+    """Ordered store of keyframes. Stage 1 only appends + reads the latest; loop
+    closure (Stage 2/3) will add retrieval + a pose graph over these nodes."""
+
+    def __init__(self):
+        self.keyframes: List[Keyframe] = []
+
+    def add(self, kf: Keyframe) -> None:
+        self.keyframes.append(kf)
+
+    @property
+    def current(self) -> Optional[Keyframe]:
+        return self.keyframes[-1] if self.keyframes else None
+
+    def __len__(self) -> int:
+        return len(self.keyframes)
 
 
 class Frontend(Protocol):
@@ -119,11 +153,26 @@ class RGBDOdometry:
         min_matches: int = 12,
         ransac_reproj_px: float = 3.0,
         frontend: Optional[Frontend] = None,
+        keyframe: bool = False,
+        kf_trans_thresh: float = 0.10,
+        kf_rot_thresh_deg: float = 10.0,
+        kf_min_inlier_ratio: float = 0.5,
     ):
         self.K = intrinsics
         self._Kmat = _k_matrix(intrinsics)
         self.min_matches = min_matches
         self.ransac_reproj_px = ransac_reproj_px
+
+        # Stage-1 keyframing (opt-in; off = byte-identical frame-to-frame baseline).
+        # Track each frame against the current keyframe rather than the immediately
+        # previous frame: less short-term drift, and the fused SuperPoint ONNX only
+        # re-extracts the keyframe once. A new keyframe is inserted when the camera
+        # has moved past a translation/rotation threshold or tracking weakens.
+        self.keyframe = keyframe
+        self.kf_trans_thresh = kf_trans_thresh
+        self.kf_rot_thresh = np.deg2rad(kf_rot_thresh_deg)
+        self.kf_min_inlier_ratio = kf_min_inlier_ratio
+        self.keyframes = KeyframeDB()
 
         # Pluggable detect/describe + match front-end. Default = ORB (CPU
         # baseline); the A10G upgrade injects a SuperPoint + LightGlue front-end
@@ -159,6 +208,8 @@ class RGBDOdometry:
         pair, returning corresponding pixels directly), otherwise the detect +
         descriptor-match branch (the ORB baseline).
         """
+        if self.keyframe:
+            return self._track_keyframe(rgb, depth, init_pose)
         if hasattr(self._frontend, "match_pair"):
             return self._track_pairwise(rgb, depth, init_pose)
         return self._track_detect_match(rgb, depth, init_pose)
@@ -247,6 +298,97 @@ class RGBDOdometry:
         self._prev = (rgb, depth)
         self.trajectory.append(self._pose.copy())
         return TrackResult(self._pose.copy(), n_matches, n_inliers, ok)
+
+    # -- Stage-1 keyframe tracking -------------------------------------------
+
+    def _pnp_relative(self, obj: np.ndarray, img: np.ndarray):
+        """RANSAC-PnP of 3-D reference points against current-frame pixels.
+
+        Returns ``(rel, n_inliers, ok)`` where ``rel`` is the cam_cur <- cam_ref
+        camera-to-world *step* (so ``cur_pose = ref_pose @ rel``), or None on fail.
+        """
+        if len(obj) < self.min_matches:
+            return None, 0, False
+        retval, rvec, tvec, inliers = cv2.solvePnPRansac(
+            obj, img, self._Kmat, None,
+            reprojectionError=self.ransac_reproj_px,
+            iterationsCount=100, flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if retval and inliers is not None and len(inliers) >= 6:
+            R, _ = cv2.Rodrigues(rvec)
+            T_rel = np.eye(4)                     # cam_ref -> cam_cur extrinsic
+            T_rel[:3, :3] = R
+            T_rel[:3, 3] = tvec.ravel()
+            return _invert_se3(T_rel), len(inliers), True
+        return None, 0, False
+
+    def _insert_keyframe(self, pose, xy, des, depth, rgb, pairwise) -> None:
+        self.keyframes.add(Keyframe(
+            id=len(self.keyframes), pose=pose.copy(), depth=depth,
+            xy=None if pairwise else xy, des=None if pairwise else des,
+            rgb=rgb.copy() if pairwise else None,
+        ))
+
+    def _need_keyframe(self, kf_pose, pose, inlier_ratio) -> bool:
+        rel = _invert_se3(kf_pose) @ pose
+        trans = float(np.linalg.norm(rel[:3, 3]))
+        rot = _rotation_angle(rel[:3, :3])
+        return (trans > self.kf_trans_thresh or rot > self.kf_rot_thresh
+                or inlier_ratio < self.kf_min_inlier_ratio)
+
+    def _track_keyframe(self, rgb: np.ndarray, depth: np.ndarray,
+                        init_pose: Optional[np.ndarray] = None) -> TrackResult:
+        """Track against the current keyframe; promote frames to keyframes on demand.
+
+        Works for both front-end kinds via the same seam as ``track``: pairwise
+        (``match_pair``) keyframes cache the raw frame; detect/match keyframes cache
+        keypoints + descriptors.
+        """
+        pairwise = hasattr(self._frontend, "match_pair")
+        cur_xy, cur_des = (None, None) if pairwise else self._frontend.detect(rgb)
+
+        kf = self.keyframes.current
+        if kf is None:                            # first frame → keyframe 0
+            pose = (init_pose.astype(np.float64).copy()
+                    if init_pose is not None else self._pose)
+            self._pose = pose
+            self._insert_keyframe(pose, cur_xy, cur_des, depth, rgb, pairwise)
+            self.trajectory.append(pose.copy())
+            return TrackResult(pose.copy(), 0, 0, True)
+
+        # Correspondences current-frame ↔ current keyframe.
+        rel, n_matches, n_inliers, ok = None, 0, 0, False
+        if pairwise:
+            uv0, uv1 = self._frontend.match_pair(kf.rgb, rgb)
+            n_matches = len(uv0)
+            if n_matches >= self.min_matches:
+                obj3d, valid = self._backproject(uv0, kf.depth)
+                rel, n_inliers, ok = self._pnp_relative(
+                    obj3d[valid], np.asarray(uv1)[valid].astype(np.float64))
+        else:
+            matches = self._frontend.match(kf.xy, kf.des, cur_xy, cur_des)
+            n_matches = len(matches)
+            if n_matches >= self.min_matches:
+                obj3d, valid = self._backproject(kf.xy[matches[:, 0]], kf.depth)
+                rel, n_inliers, ok = self._pnp_relative(
+                    obj3d[valid], cur_xy[matches[:, 1]][valid].astype(np.float64))
+
+        prev_pose = self._pose
+        if ok:
+            new_pose = kf.pose @ rel
+            self._last_rel = _invert_se3(prev_pose) @ new_pose   # step, for coasting
+        else:
+            new_pose = prev_pose @ self._last_rel                # constant-velocity coast
+        self._pose = new_pose
+        self.trajectory.append(new_pose.copy())
+
+        # A well-tracked frame that has moved far enough (or whose match is
+        # weakening) becomes the next anchor. Don't anchor on a failed step.
+        inlier_ratio = n_inliers / max(n_matches, 1)
+        if ok and self._need_keyframe(kf.pose, new_pose, inlier_ratio):
+            self._insert_keyframe(new_pose, cur_xy, cur_des, depth, rgb, pairwise)
+
+        return TrackResult(new_pose.copy(), n_matches, n_inliers, ok)
 
 
 class OdometryPoseProvider:
