@@ -1,8 +1,11 @@
 # Design note — keyframing & loop closure for the SLAM front-end
 
-Status: **Stage 1 implemented** (keyframing + frame-to-keyframe tracking, opt-in,
-ORB default, Mac-tested — `tests/test_keyframe_odometry.py`). Stages 2–3 (loop
-detection, pose-graph optimisation) remain. Prep for M6 remaining item #2.
+Status: **Stages 1 & 3 implemented** (keyframing + frame-to-keyframe tracking, and
+the SE(3) pose-graph optimisation back-end — both Mac-tested,
+`tests/test_keyframe_odometry.py` + `tests/test_pose_graph.py`). **Stage 2** (loop
+*detection* — descriptor retrieval + geometric verification) is the remaining gap:
+its retrieval quality needs box/TUM, and it's what feeds real loop edges to the
+Stage-3 optimiser. Prep for M6 remaining item #2.
 
 ## Why
 
@@ -46,15 +49,20 @@ A cheap, standalone win that also cuts front-end cost.
 - A candidate is a loop if geometric verification yields enough inliers AND the
   candidate is temporally distant (avoid matching neighbours).
 
-### Stage 3 — Pose-graph optimisation
-- Nodes = keyframe poses; edges = odometry constraints (consecutive KFs) + loop
-  constraints (verified matches).
-- Optimise with `g2o`/`gtsam` if available; a dependency-free fallback is a small
-  Gauss-Newton / Levenberg on SE(3) (`scipy.optimize` + a manual SE(3) manifold)
-  so the Mac dev path keeps working without native SLAM libs.
-- On loop closure, re-run the optimiser and rewrite `self.trajectory`; the
-  pipeline's map (`TSDFVolume`) would need a re-integration pass from corrected
-  KF poses — treat map correction as a follow-up (expensive; only at loop events).
+### Stage 3 — Pose-graph optimisation — ✅ DONE
+- `src/slam/pose_graph.py`: nodes = keyframe poses; edges = odometry constraints
+  (consecutive KFs, via `from_keyframes`) + loop constraints (verified matches).
+- **Dependency-free**: a hand-rolled SE(3) manifold (closed-form exp/log via
+  Rodrigues + the left Jacobian) and a damped Gauss-Newton solve with a numerical
+  Jacobian in pure numpy — no g2o/gtsam/scipy, so the Mac dev path just works. Node 0
+  is fixed (gauge). Small keyframe graphs ⇒ dense solve is plenty.
+- `RGBDOdometry.optimize_keyframes(loop_edges)` builds the graph from its keyframes,
+  optimises, and writes corrected poses back to the `Keyframe`s.
+- Mac-tested (`tests/test_pose_graph.py`): SE(3) exp/log round-trip, recovery of a
+  consistent graph from a drifted guess, **loop closure reduces end-of-trajectory
+  drift**, and the odometry integration.
+- Still a follow-up: propagating corrected KF poses to the per-frame trajectory and
+  re-integrating the `TSDFVolume` map (expensive; only at loop events).
 
 ## Scope guard
 
