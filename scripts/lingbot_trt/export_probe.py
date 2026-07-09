@@ -154,10 +154,14 @@ def main() -> int:
         return 2
 
     # Export in fp32 for a clean parity check; TensorRT does its own fp16 later.
+    # Cast ONLY floating tensors — integer/index tensors (e.g. RoPE's `pos`, which
+    # indexes an embedding table) must keep their dtype or F.embedding breaks.
+    def _cast(t):
+        return t.float() if (torch.is_tensor(t) and t.is_floating_point()) else t
+
     target = target.float()
-    a_list = [x.float() if torch.is_tensor(x) else x for x in captured["args"]]
-    kw = {k: (v.float() if torch.is_tensor(v) else v)
-          for k, v in captured["kwargs"].items()}
+    a_list = [_cast(x) for x in captured["args"]]
+    kw = {k: _cast(v) for k, v in captured["kwargs"].items()}
 
     # Which entries are tensors → graph inputs; everything else is baked in.
     slots, tensor_inputs = [], []
