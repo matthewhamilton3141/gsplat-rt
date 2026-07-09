@@ -390,6 +390,26 @@ class RGBDOdometry:
 
         return TrackResult(new_pose.copy(), n_matches, n_inliers, ok)
 
+    def optimize_keyframes(self, loop_edges=None):
+        """Run pose-graph optimisation over the keyframes and write corrected poses
+        back (Stage 3 loop-closure back-end).
+
+        ``loop_edges`` = ``(i, j, measurement, info)`` closures from loop detection
+        (Stage 2); with none, the odometry-only graph is already consistent and this
+        is a no-op. Returns the optimised :class:`PoseGraph`, or None with < 2
+        keyframes. Per-frame trajectory / TSDF re-integration from the corrected
+        keyframes is a deliberate follow-up (see the design note).
+        """
+        from slam.pose_graph import from_keyframes
+        kfs = self.keyframes.keyframes
+        if len(kfs) < 2:
+            return None
+        g = from_keyframes([kf.pose for kf in kfs], loop_edges)
+        g.optimize()
+        for kf, node in zip(kfs, g.nodes):
+            kf.pose = node
+        return g
+
 
 class OdometryPoseProvider:
     """Adapts RGBDOdometry to the PipelineManager pose-provider contract.
