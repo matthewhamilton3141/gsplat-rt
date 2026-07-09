@@ -8,6 +8,17 @@ is paste-into-the-box; the Mac cannot run any of it.
 Prereqs already true on a bootstrapped box (`bash scripts/brev_setup.sh`): TensorRT
 + onnxruntime-gpu in the system env, TUM fr1/desk fetched, depth engine built.
 
+**Two hard-won environment facts (2026-07-09, fresh box) — read before pasting:**
+- **Interpreter:** brev's Jupyter terminal resolves bare `python3` to an interpreter
+  WITHOUT the deps (no numpy/tensorrt_libs). The stack lives under
+  `~/.local/lib/python3.10`, so use **`python3.10`** explicitly on this box.
+- **TensorRT major must be 10.** onnxruntime-gpu 1.2x's TensorRT EP links
+  `libnvinfer.so.10`. If `pip` pulled TensorRT 11 (`libnvinfer.so.11`), the EP fails
+  and silently drops to CUDA. Fix: `pip install "tensorrt>=10,<11"` and **rebuild the
+  depth engines** (`rm models/depth_engine*.engine; python3.10 src/depth/compile_trt.py
+  --fp16`) — a TRT-11-built engine won't deserialize under TRT-10 (depth would fall
+  back to mock). Now pinned in requirements.txt + brev_setup.sh so fresh boxes are OK.
+
 ## 0. One-time: get the fused ONNX onto the box
 
 The fused SuperPoint+LightGlue ONNX is **not committed**. Produce it (idempotent):
@@ -25,16 +36,17 @@ still load before touching the pipeline. Expect ~3.5 cm ATE, ~7 ms/frame engine.
 
 ```bash
 cd ~/gsplat-rt
-python3 scripts/eval_odometry.py --frontend superpoint --provider tensorrt \
+python3.10 scripts/eval_odometry.py --frontend superpoint --provider tensorrt \
     --sp-onnx models/sp_lg_tum.onnx --max-frames 200
-# PASS looks like: ATE-RMSE ~3.5 cm, 200/200 PnP-ok
+# PASS looks like: ATE-RMSE ~3.3-3.5 cm, 200/200 PnP-ok  (2026-07-09: 3.3 cm)
 ```
 
-If ORT falls back to CPU and crawls with `libnvinfer.so.10: cannot open`, the
-TensorRT EP can't see libnvinfer. In the **system env** this was NOT needed
-(confirmed), but if it bites:
+The TensorRT EP needs libnvinfer on `LD_LIBRARY_PATH` or it fails with
+`libnvinfer.so.10: cannot open` and drops to CUDA/CPU. This **IS** required
+(an earlier note here claimed the system env didn't need it — that was a stale,
+pre-reprovision box; the 2026-07-09 fresh box confirmed it is needed). Always:
 ```bash
-export LD_LIBRARY_PATH=$(python3 -c 'import os,tensorrt_libs; print(os.path.dirname(tensorrt_libs.__file__))'):$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$(python3.10 -c 'import os,tensorrt_libs; print(os.path.dirname(tensorrt_libs.__file__))'):$LD_LIBRARY_PATH
 ```
 
 ## 2. THE VERIFY: superpoint pose tracking inside the live pipeline
@@ -57,7 +69,7 @@ ffmpeg -framerate 30 -pattern_type glob \
 ```bash
 # --realtime plays at frame rate; drop it to run as fast as the box allows and
 # read the sustained FPS.
-python3 scripts/run_live.py \
+python3.10 scripts/run_live.py \
     --source /tmp/tum_fr1_desk.mp4 \
     --pose-tracking superpoint --pose-backend tensorrt \
     --pose-onnx models/sp_lg_tum.onnx \
@@ -89,7 +101,7 @@ Correct any doc number **down** to what the box shows — never assume.
 
 Exercises the relative→metric aligner on the live stream:
 ```bash
-python3 scripts/run_live.py --source /tmp/tum_fr1_desk.mp4 \
+python3.10 scripts/run_live.py --source /tmp/tum_fr1_desk.mp4 \
     --pose-tracking superpoint --pose-backend tensorrt \
     --metric-scale-monocular --duration 30
 # expect log: "Monocular scale reference active (anchor=1.000)"
