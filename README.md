@@ -4,7 +4,9 @@
 
 gsplat-rt turns a live RGB stream into a 3D scene a robot can both *see* and *touch*: a Gaussian-Splat representation for rendering, an occupancy/collision mesh for physics, and an OpenUSD stage ready to drop into Isaac Sim / Omniverse. It runs the full depth → pose → fusion → export loop in real time on a single GPU, and every performance number below is measured on an NVIDIA A10G — not estimated. A pure-Python mock depth path keeps the whole pipeline (and all non-GPU tests) runnable with no GPU at all.
 
-![anisotropic Gaussian-splat rendering in the browser viewer](docs/viewer_splats.png)
+![Live monocular reconstruction of a TUM desk sequence as 3D Gaussian splats](docs/reconstruction_desk.png)
+
+*Real pipeline output — a monocular RGB stream (TUM fr1/desk) reconstructed into 3D Gaussian splats, with real source intrinsics + cross-frame metric scale.*
 
 ## Headline results *(measured, NVIDIA A10G)*
 
@@ -52,8 +54,11 @@ Stages run on separate threads and communicate through bounded queues, so depth 
 ## Quickstart
 
 ```bash
-# 1. install
+# 1. install  (Python 3.10+, CUDA 11.8+, TensorRT 10+)
+git clone https://github.com/matthewhamilton3141/gsplat-rt.git && cd gsplat-rt
 pip install -r requirements.txt
+pip install tensorrt --extra-index-url https://pypi.ngc.nvidia.com   # not on default PyPI
+python setup.py build_ext --inplace                                  # builds the CUDA TSDF kernel
 
 # 2. build the depth engine (ONNX → TensorRT FP16)
 python src/depth/export_onnx.py --fp16
