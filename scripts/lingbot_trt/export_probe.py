@@ -101,6 +101,8 @@ def main() -> int:
     ap.add_argument("--opset", type=int, default=18)   # 18+: Split w/ num_outputs (dynamo exporter)
     ap.add_argument("--bench-torch", type=int, default=0,
                     help="time the block forward in torch over N runs (per-block baseline)")
+    ap.add_argument("--dynamo", action="store_true",
+                    help="use the dynamo ONNX exporter (default: classic — TRT-friendly weights)")
     ap.add_argument("--height", type=int, default=392, help="preprocessed H (canonical crop)")
     ap.add_argument("--width", type=int, default=518, help="preprocessed W")
     args = ap.parse_args()
@@ -220,12 +222,17 @@ def main() -> int:
     # --- export ----------------------------------------------------------------
     in_names = [f"in{i}" for i in range(len(tensor_inputs))]
     out_names = [f"out{i}" for i in range(len(ref))]
-    print(f"Exporting → {args.onnx_out} (opset {args.opset}) ...")
+    exporter = "dynamo" if args.dynamo else "classic (TorchScript)"
+    print(f"Exporting → {args.onnx_out} (opset {args.opset}, {exporter}) ...")
     try:
+        # Default to the classic TorchScript exporter: TensorRT's OnnxParser reliably
+        # imports its weights, whereas dynamo-exported initializers trip TRT's
+        # convertOnnxWeights (onnxruntime loads them fine — hence Stage-1 parity did).
         torch.onnx.export(
             wrapper, tuple(tensor_inputs), args.onnx_out,
             input_names=in_names, output_names=out_names,
             opset_version=args.opset, do_constant_folding=True,
+            dynamo=args.dynamo,
         )
     except Exception as e:
         print(f"\nONNX EXPORT FAILED: {type(e).__name__}: {e}")
