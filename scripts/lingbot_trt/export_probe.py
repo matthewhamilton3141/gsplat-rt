@@ -105,6 +105,8 @@ def main() -> int:
                     help="use the dynamo ONNX exporter (default: classic — TRT-friendly weights)")
     ap.add_argument("--half", action="store_true",
                     help="export a true fp16 ONNX (fp16 weights + I/O) for a strongly-typed engine")
+    ap.add_argument("--dump-inputs", default=None,
+                    help="save the real captured block inputs to this .npz (INT8 calibration)")
     ap.add_argument("--height", type=int, default=392, help="preprocessed H (canonical crop)")
     ap.add_argument("--width", type=int, default=518, help="preprocessed W")
     args = ap.parse_args()
@@ -227,6 +229,17 @@ def main() -> int:
     # --- export ----------------------------------------------------------------
     in_names = [f"in{i}" for i in range(len(tensor_inputs))]
     out_names = [f"out{i}" for i in range(len(ref))]
+
+    # Dump the real captured block inputs (fp32) for INT8 calibration. One captured
+    # activation tensor is millions of values — a solid range/histogram source.
+    if args.dump_inputs:
+        dump = {}
+        for name, t in zip(in_names, tensor_inputs):
+            arr = t.detach().cpu().numpy()
+            dump[name] = arr.astype(np.float32) if arr.dtype == np.float16 else arr
+        np.savez(args.dump_inputs, **dump)
+        print(f"Dumped calibration inputs → {args.dump_inputs} "
+              f"({', '.join(f'{n}:{v.shape}/{v.dtype}' for n, v in dump.items())})")
     exporter = "dynamo" if args.dynamo else "classic (TorchScript)"
     print(f"Exporting → {args.onnx_out} (opset {args.opset}, {exporter}) ...")
     try:

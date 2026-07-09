@@ -32,7 +32,47 @@ def _trt_to_torch(trt, dt):
     }[dt]
 
 
-def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool,
+def make_calibrator(npz_path: str, cache_path: str, trt):
+    """MinMax INT8 calibrator fed from an .npz of real block inputs.
+
+    MinMax (not entropy) is the usual first choice for transformer activations.
+    One captured activation tensor holds millions of values, enough to estimate
+    per-tensor ranges. Device buffers are torch CUDA tensors (kept alive on self).
+    """
+    import numpy as np
+    import torch
+
+    data = np.load(npz_path)
+    bufs = {k: torch.as_tensor(data[k]).cuda().contiguous() for k in data.files}
+
+    class _Calib(trt.IInt8MinMaxCalibrator):
+        def __init__(self):
+            super().__init__()
+            self._served = False
+
+        def get_batch_size(self):
+            return 1
+
+        def get_batch(self, names):
+            if self._served:
+                return None
+            self._served = True
+            return [int(bufs[n].data_ptr()) for n in names]
+
+        def read_calibration_cache(self):
+            import os
+            return open(cache_path, "rb").read() if os.path.exists(cache_path) else None
+
+        def write_calibration_cache(self, cache):
+            with open(cache_path, "wb") as f:
+                f.write(cache)
+
+    calib = _Calib()
+    calib._bufs = bufs                                # keep device buffers alive
+    return calib
+
+
+def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool, int8, calibrator,
                  workspace_gb: int, logger, trt) -> bytes:
     builder = trt.Builder(logger)
     flags = 0
@@ -52,7 +92,13 @@ def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool,
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
-    if strongly_typed:
+    if int8:
+        config.set_flag(trt.BuilderFlag.INT8)
+        if fp16 and hasattr(trt.BuilderFlag, "FP16"):
+            config.set_flag(trt.BuilderFlag.FP16)   # fp16 fallback for un-quantized ops
+        config.int8_calibrator = calibrator
+        print("[trt] precision: INT8 (+fp16 fallback), calibrated from real inputs")
+    elif strongly_typed:
         # Precision comes from the (fp16) ONNX's own dtypes — no builder flag, no
         # boundary cast nodes. Requires a true fp16 ONNX (export_probe --half).
         print("[trt] precision: STRONGLY-TYPED (from the fp16 ONNX's dtypes)")
@@ -78,6 +124,10 @@ def main() -> int:
     ap.add_argument("--no-fp16", action="store_true", help="build FP32/TF32 instead of FP16")
     ap.add_argument("--strongly-typed", action="store_true",
                     help="precision from the ONNX dtypes (use with a fp16 ONNX; no cast nodes)")
+    ap.add_argument("--int8", action="store_true",
+                    help="INT8 (+fp16 fallback), calibrated from --calib-npz (use the fp32 ONNX)")
+    ap.add_argument("--calib-npz", default=None, help="real block inputs for INT8 calibration")
+    ap.add_argument("--calib-cache", default="/tmp/lingbot_int8.cache")
     ap.add_argument("--workspace-gb", type=int, default=8)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=50)
@@ -92,8 +142,14 @@ def main() -> int:
         return 2
 
     logger = trt.Logger(trt.Logger.WARNING)
+    calibrator = None
+    if args.int8:
+        if not args.calib_npz:
+            print("ERROR: --int8 needs --calib-npz (export_probe --dump-inputs).")
+            return 2
+        calibrator = make_calibrator(args.calib_npz, args.calib_cache, trt)
     engine_bytes = build_engine(args.onnx, not args.no_fp16, args.strongly_typed,
-                                args.workspace_gb, logger, trt)
+                                args.int8, calibrator, args.workspace_gb, logger, trt)
     if args.engine_out:
         with open(args.engine_out, "wb") as f:
             f.write(engine_bytes)
