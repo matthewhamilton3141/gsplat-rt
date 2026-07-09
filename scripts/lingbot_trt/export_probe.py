@@ -110,7 +110,18 @@ def main() -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(_model_args(args), device).eval()
-    agg = model.aggregator
+
+    # Mirror demo.py's dtype handling so we capture the exact real code path:
+    # bf16 aggregator (sm80+) run under autocast; calling the aggregator directly
+    # skips inference_windowed's setup and trips a float-vs-int index error.
+    if device.type == "cuda":
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    else:
+        dtype = torch.float32
+    if dtype != torch.float32 and getattr(model, "aggregator", None) is not None:
+        print(f"Casting aggregator to {dtype} (mirrors demo.py)")
+        model.aggregator = model.aggregator.to(dtype=dtype)
+
     target = _resolve(model, args.target)
     print(f"Target module: {args.target} = {type(target).__name__}")
 
@@ -124,12 +135,15 @@ def main() -> int:
 
     handle = target.register_forward_pre_hook(hook, with_kwargs=True)
 
-    imgs = torch.rand(1, args.window_size, 3, args.height, args.width, device=device)
+    if hasattr(model, "clean_kv_cache"):
+        model.clean_kv_cache()
+    imgs = torch.rand(args.window_size, 3, args.height, args.width, device=device)
     try:
-        with torch.no_grad():
-            agg(imgs, selected_idx=[4, 11, 17, 23],
-                num_frame_for_scale=args.num_scale_frames,
-                sliding_window_size=64, num_frame_per_block=1)
+        with torch.no_grad(), torch.amp.autocast(device.type, dtype=dtype):
+            model.inference_windowed(
+                imgs, window_size=args.window_size, overlap_size=0,
+                num_scale_frames=args.num_scale_frames, keyframe_interval=1,
+            )
     except _Captured:
         pass
     finally:
