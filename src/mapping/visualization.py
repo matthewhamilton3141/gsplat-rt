@@ -142,6 +142,45 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return np.asarray(v, dtype=np.float64) / (np.linalg.norm(v) + 1e-12)
 
 
+def _rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Rodrigues rotation taking unit vector ``a`` onto unit vector ``b``."""
+    a, b = _normalize(a), _normalize(b)
+    c = float(np.dot(a, b))
+    if c > 1.0 - 1e-9:
+        return np.eye(3)
+    if c < -1.0 + 1e-9:                                   # 180°: any ⟂ axis
+        axis = np.cross(a, [1.0, 0.0, 0.0])
+        if np.linalg.norm(axis) < 1e-6:
+            axis = np.cross(a, [0.0, 0.0, 1.0])
+        axis = _normalize(axis)
+        K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]])
+        return np.eye(3) + 2.0 * (K @ K)
+    axis = np.cross(a, b)
+    s = np.linalg.norm(axis)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]])
+    return np.eye(3) + K + K @ K * ((1 - c) / (s * s))
+
+
+def orient_upright(points, cam_up=None, world_up=(0.0, 0.0, 1.0)):
+    """Rotate the cloud so its estimated up aligns with ``world_up``.
+
+    Reuses :func:`estimate_up`, then rigidly rotates about the cloud centroid so
+    the scene loads level in a 3-D viewer whose up axis is ``world_up`` (viser's
+    default is +Z). Returns ``(rotated_points float32, R 3x3)``.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        return pts.astype(np.float32), np.eye(3)
+    up = estimate_up(pts, cam_up=cam_up)
+    R = _rotation_between(up, np.asarray(world_up, dtype=np.float64))
+    centre = np.median(pts, axis=0)
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        rotated = (pts - centre) @ R.T + centre
+    return rotated.astype(np.float32), R
+
+
 def estimate_up(
     points: Sequence[Sequence[float]],
     cam_up: Optional[Sequence[float]] = None,
