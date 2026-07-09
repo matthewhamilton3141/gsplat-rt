@@ -97,14 +97,30 @@ What we need to record (and only then put in README/memory):
 
 Correct any doc number **down** to what the box shows — never assume.
 
-## NEXT RUN: map-coherence verify (intrinsics + metric scale)
+## map-coherence verify (intrinsics + metric scale) — ✅ PASSED 2026-07-09
 
-Status after 2026-07-09: the TensorRT pose path runs live end-to-end at ~30 fps
-(verified), but the live TUM *map* was NOISE — `run_live` used a generic FOV
-camera (forcing fx==fy) on TUM's 640x480→518x518 non-uniform resize, and depth is
-monocular/relative. Two fixes now exist to try together:
+RESULT: the live TUM map now renders a recognisable, colored, flat desk. Best
+demo command (one clean pass, drift-free window):
+```bash
+python3.10 scripts/run_live.py --source /tmp/tum_fr1_desk.mp4 \
+    --pose-tracking superpoint --pose-backend tensorrt --pose-onnx models/sp_lg_tum.onnx \
+    --tum-intrinsics --metric-scale-monocular \
+    --max-splats 300000 --duration 60          # NO --loop / --realtime
+```
+View `output/live_scene_points_preview.png` + `_splat_preview.png` in Jupyter.
+Tuning: 150k = clean but partial, 300k = sweet spot, 700k = full pass but WARPS
+(monocular pose drift — the real fix is loop closure). Occupancy png is ~solid red
+on desk footage (no open floor); that's expected, not a bug — demo it on a
+room-scale sequence if needed.
+
+Original status (2026-07-09, since resolved): the TensorRT pose path runs live
+end-to-end at ~30 fps, but the live TUM *map* was NOISE — `run_live` used a generic
+FOV camera (forcing fx==fy) on TUM's 640x480→518x518 non-uniform resize, and depth
+is monocular/relative. Fixes (all now landed):
 - `--tum-intrinsics` — real freiburg1 intrinsics, rescaled to depth space (fx!=fy).
 - `--metric-scale-monocular` — cross-frame scale consistency for relative depth.
+- plus a metric-scale length bug, auto-framed previews, and `--max-splats`
+  accumulation (see git log on the branch).
 
 Requires branch **feat/run-live-source-intrinsics** (the intrinsics flags aren't
 on main yet). On a fresh box, checkout it BEFORE `brev_setup.sh`:
