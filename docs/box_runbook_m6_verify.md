@@ -121,10 +121,30 @@ python3.10 scripts/run_live.py --source /tmp/tum_fr1_desk.mp4 \
     --realtime --loop --duration 30
 # banner must show: "Camera intrinsics: TUM fr1 ..." and "Monocular scale reference active"
 ```
-PASS = `output/live_scene_occupancy.png` / `_splat_preview.png` show a coherent
-desk scene (view in Jupyter file browser), not the origin-blob/noise from before.
-If still noisy, the residual is monocular-depth scale drift — fall back to
-`scripts/reconstruct_tum.py` (real depth + real intrinsics) for a clean visual.
+PASS = the preview PNGs show a coherent desk scene (view in Jupyter file
+browser), not the origin-blob/noise from before. The run now writes THREE
+glanceable images (all auto-framed / cropped so the scene fills the frame — no
+more corner speck):
+- `output/live_scene_points_preview.png` — cloud as crisp points
+- `output/live_scene_splat_preview.png` — cloud as soft splats
+- `output/live_scene_occupancy.png` — top-down map, cropped to the observed area
+
+The 3-D `.usdz` also opens natively on a Mac (Quick Look / double-click) — no
+browser or PLY needed; the Three.js `run_viewer.py` still wants a `.ply`.
+
+Two earlier gotchas are now FIXED in code (no longer expected in the log):
+- `scale fit failed on frame N … pred_values and ref_depth must have the same
+  length` — the monocular scale reference sampled predictions over all inliers
+  but metric depth over only the cheirality-valid subset. Fixed
+  (`monocular_scale._geometry_step`); the metric-scale update no longer silently
+  skips frames.
+- the splat preview projected the world-space cloud through an origin camera, so
+  a moving trajectory pushed everything into a corner. Both previews now
+  auto-frame the cloud.
+
+If the map is still noisy after this, the residual is monocular-depth scale
+drift — fall back to `scripts/reconstruct_tum.py` (real depth + real intrinsics)
+for a clean visual.
 
 Reminders that cost time tonight: use **`python3.10`** (brev's bare python3 lacks
 deps); run inside **tmux** (SSH drops); **don't kill a run early** — first-frame

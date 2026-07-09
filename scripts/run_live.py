@@ -199,7 +199,8 @@ def main() -> int:
     print(f"\nDone. frames={s['frames']} exports={s['exports']} "
           f"splats={s['gaussians']} depth~{s['depth_ms']:.1f}ms")
     print("Wrote:")
-    for p in (manager.usdz_path, manager.occupancy_png_path, manager.preview_png_path):
+    for p in (manager.usdz_path, manager.occupancy_png_path,
+              manager.preview_png_path, manager.points_png_path):
         mark = "✓" if p and os.path.exists(p) else "·"
         print(f"  {mark} {p}")
     return 0

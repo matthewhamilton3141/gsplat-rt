@@ -204,9 +204,14 @@ class MonocularScaleReference:
         self._landmarks = {int(cid): float(md)
                            for cid, md in zip(ids_cur, metric_cur)}
 
+        # Sample the predicted value at the SAME cheirality-valid current-frame
+        # pixels that produced metric_cur. uv_b spans all inliers; the triangulation
+        # keeps only the `valid` subset, so pred_values must be filtered by `valid`
+        # too or the aligner gets mismatched-length arrays (a silent scale-fit skip).
+        uv_b_valid = uv_b[valid]
         h, w = rel_depth.shape[:2]
-        cols = np.clip(np.rint(uv_b[:, 0]).astype(int), 0, w - 1)
-        rows = np.clip(np.rint(uv_b[:, 1]).astype(int), 0, h - 1)
+        cols = np.clip(np.rint(uv_b_valid[:, 0]).astype(int), 0, w - 1)
+        rows = np.clip(np.rint(uv_b_valid[:, 1]).astype(int), 0, h - 1)
         pred_values = np.asarray(rel_depth)[rows, cols]
         return pred_values, metric_cur
 

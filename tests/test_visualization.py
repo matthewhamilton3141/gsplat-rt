@@ -26,6 +26,7 @@ from mapping.collision_proxy import CameraIntrinsics, TSDFVolume
 from mapping.visualization import (
     occupancy_to_ascii,
     save_occupancy_png,
+    save_points_preview,
     save_splat_preview,
 )
 
@@ -84,45 +85,93 @@ def test_save_occupancy_png_dimensions():
         assert img.shape == (32 * 8, 32 * 8, 3)
 
 
+def test_save_occupancy_png_crop_shrinks_to_observed():
+    """Cropping trims the mostly-unknown volume down to the observed patch."""
+    grid = np.full((40, 40), -1, dtype=np.int8)
+    grid[18:22, 18:22] = 1                          # small observed block
+    with tempfile.TemporaryDirectory() as d:
+        full = cv2.imread(save_occupancy_png(
+            grid, os.path.join(d, "full.png"), cell_px=4, crop=False))
+        crop = cv2.imread(save_occupancy_png(
+            grid, os.path.join(d, "crop.png"), cell_px=4, crop=True, crop_margin=2))
+        assert full.shape == (40 * 4, 40 * 4, 3)
+        # 4-wide block + 2 margin each side = 8 cells
+        assert crop.shape == (8 * 4, 8 * 4, 3)
+
+
 # ---------------------------------------------------------------------------
-# save_splat_preview
+# save_points_preview / save_splat_preview (auto-framed)
 # ---------------------------------------------------------------------------
 
-def test_save_splat_preview_writes_png():
-    rng = np.random.default_rng(0)
-    # Points in front of the camera (z > 0), spread across the frustum
-    pts = np.column_stack([
-        rng.uniform(-1, 1, 500),
-        rng.uniform(-1, 1, 500),
-        rng.uniform(1.0, 3.0, 500),
+def _spread_cloud(n: int = 500, seed: int = 0, offset=(0.0, 0.0, 2.0)) -> np.ndarray:
+    """A cloud sitting anywhere in space — auto-framing must still frame it."""
+    rng = np.random.default_rng(seed)
+    return np.column_stack([
+        rng.uniform(-1, 1, n) + offset[0],
+        rng.uniform(-1, 1, n) + offset[1],
+        rng.uniform(-0.5, 0.5, n) + offset[2],
     ]).astype(np.float32)
+
+
+def test_save_points_preview_writes_png():
     with tempfile.TemporaryDirectory() as d:
-        path = save_splat_preview(
-            pts, fx=259.0, fy=259.0, cx=259.0, cy=259.0,
-            width=518, height=518, path=os.path.join(d, "prev.png"),
-        )
+        path = save_points_preview(_spread_cloud(), os.path.join(d, "pts.png"),
+                                   width=518, height=518)
         assert path is not None
         img = cv2.imread(path)
         assert img.shape == (518, 518, 3)
-        # Something was actually drawn (not a flat background)
+        assert img.std() > 1.0                       # something was drawn
+
+
+def test_save_splat_preview_writes_png():
+    with tempfile.TemporaryDirectory() as d:
+        path = save_splat_preview(_spread_cloud(), os.path.join(d, "prev.png"),
+                                  width=518, height=518)
+        assert path is not None
+        img = cv2.imread(path)
+        assert img.shape == (518, 518, 3)
         assert img.std() > 1.0
 
 
-def test_save_splat_preview_empty_returns_none():
+def test_auto_frame_handles_world_space_offset():
+    """A cloud far from the origin still fills the frame (the pose-tracking fix):
+    projecting through an origin camera would push it off-screen, auto-framing
+    recentres on it. Verify the drawn content isn't stuck in one corner."""
     with tempfile.TemporaryDirectory() as d:
-        out = os.path.join(d, "prev.png")
-        assert save_splat_preview(
-            np.empty((0, 3), np.float32), 259, 259, 259, 259, 518, 518, out
-        ) is None
-        assert not os.path.exists(out)
+        path = save_points_preview(
+            _spread_cloud(offset=(30.0, -20.0, 50.0)),
+            os.path.join(d, "far.png"), width=256, height=256)
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        assert img is not None
+        drawn = np.argwhere(img > 30)                # non-background pixels
+        assert drawn.shape[0] > 0
+        cy, cx = drawn.mean(axis=0)
+        # Centroid of drawn content lands near the middle, not jammed in a corner.
+        assert 64 < cx < 192 and 64 < cy < 192
 
 
-def test_save_splat_preview_all_behind_camera_returns_none():
-    pts = np.array([[0.0, 0.0, -1.0], [0.1, 0.1, -2.0]], dtype=np.float32)
+def test_splat_preview_uses_supplied_colors():
+    """Per-splat colours propagate: an all-red cloud renders red, not the ramp."""
+    pts = _spread_cloud(n=300)
+    colors = np.tile([1.0, 0.0, 0.0], (pts.shape[0], 1)).astype(np.float32)  # RGB red
     with tempfile.TemporaryDirectory() as d:
-        out = os.path.join(d, "prev.png")
-        assert save_splat_preview(pts, 259, 259, 259, 259, 518, 518, out) is None
-        assert not os.path.exists(out)
+        path = save_splat_preview(pts, os.path.join(d, "red.png"),
+                                  width=256, height=256, colors=colors)
+        img = cv2.imread(path)                       # BGR
+        drawn = img[img.sum(axis=2) > 30]            # non-background pixels
+        assert drawn.shape[0] > 0
+        # Red channel (BGR index 2) dominates.
+        assert drawn[:, 2].mean() > drawn[:, 0].mean() + 40
+        assert drawn[:, 2].mean() > drawn[:, 1].mean() + 40
+
+
+def test_previews_empty_returns_none():
+    with tempfile.TemporaryDirectory() as d:
+        empty = np.empty((0, 3), np.float32)
+        assert save_points_preview(empty, os.path.join(d, "p.png")) is None
+        assert save_splat_preview(empty, os.path.join(d, "s.png")) is None
+        assert not os.path.exists(os.path.join(d, "p.png"))
+        assert not os.path.exists(os.path.join(d, "s.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +246,10 @@ def test_pipeline_writes_preview_pngs():
 
         assert os.path.exists(manager.occupancy_png_path), "occupancy PNG missing"
         assert os.path.exists(manager.preview_png_path), "splat preview PNG missing"
+        assert os.path.exists(manager.points_png_path), "points preview PNG missing"
         assert cv2.imread(manager.occupancy_png_path) is not None
         assert cv2.imread(manager.preview_png_path) is not None
+        assert cv2.imread(manager.points_png_path) is not None
 
 
 if __name__ == "__main__":

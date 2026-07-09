@@ -319,6 +319,7 @@ class PipelineManager:
         self.usdz_path: str = ""
         self.occupancy_png_path: str = ""
         self.preview_png_path: str = ""
+        self.points_png_path: str = ""
         self.ply_path: str = ""
 
     # ------------------------------------------------------------------
@@ -486,6 +487,7 @@ class PipelineManager:
         self.usdz_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.usdz")
         self.occupancy_png_path = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_occupancy.png")
         self.preview_png_path   = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_splat_preview.png")
+        self.points_png_path    = os.path.join(cfg.output_dir, f"{cfg.usd_stem}_points_preview.png")
         self.ply_path           = os.path.join(cfg.output_dir, f"{cfg.usd_stem}.ply")
 
         logger.info("PipelineManager starting — output: %s", cfg.output_dir)
@@ -928,28 +930,33 @@ class PipelineManager:
         if not self._config.write_previews:
             return
         try:
-            from mapping.visualization import save_occupancy_png, save_splat_preview
+            from mapping.visualization import (save_occupancy_png,
+                                               save_points_preview,
+                                               save_splat_preview)
         except ImportError:
             return
 
         try:
             grid = self._collision_extractor.get_latest_occupancy()
             if grid is not None:
-                save_occupancy_png(grid, self.occupancy_png_path)
+                save_occupancy_png(grid, self.occupancy_png_path, crop=True)
         except Exception:
             logger.exception("Occupancy PNG write failed")
 
         try:
-            positions = list(self._gaussian_positions)
+            positions = list(self._gaussian_positions)     # snapshot the deque
+            colors = list(self._gaussian_colors)           # parallel, may lag
+            # Only pair colours when they line up 1:1 with positions (the deques
+            # can be mid-extend); otherwise fall back to the depth ramp.
+            cols = colors if len(colors) == len(positions) else None
             if positions:
-                save_splat_preview(
-                    positions,
-                    self._fx, self._fy, self._cx, self._cy,
-                    self._config.depth_input_w, self._config.depth_input_h,
-                    self.preview_png_path,
-                )
+                w, h = self._config.depth_input_w, self._config.depth_input_h
+                save_points_preview(positions, self.points_png_path,
+                                    width=w, height=h, colors=cols)
+                save_splat_preview(positions, self.preview_png_path,
+                                   width=w, height=h, colors=cols)
         except Exception:
-            logger.exception("Splat preview write failed")
+            logger.exception("Preview PNG write failed")
 
     def _splat_export_arrays(self):
         """Assemble (means, scales, rotations, opacities, sh_coeffs) for USD.

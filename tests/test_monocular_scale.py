@@ -144,6 +144,52 @@ def test_monocular_reference_global_scale_consistency():
     assert ref.baseline is not None
 
 
+def test_geometry_step_equal_length_under_cheirality_drop(monkeypatch):
+    """Regression: pred_values and metric_cur must stay equal-length even when
+    triangulation drops some inliers as cheirality failures.
+
+    The bug: pred_values was sampled at ALL inlier pixels (uv_b) while metric_cur
+    was the valid-only subset, so the two arrays diverged whenever a point failed
+    the in-front-of-both-cameras check. DepthScaleAligner.fit then raised
+    'pred_values and ref_depth must have the same length' and the live run
+    silently skipped the scale update (the 'scale fit failed on frame N' errors).
+
+    Cheirality drops are hard to force through real geometry (RANSAC + robust
+    triangulation reject the very points that would flip), so we drive the exact
+    condition directly: a pose with all matches as inliers, and a triangulation
+    whose `valid` mask drops a few. Only the fixed indexing keeps the outputs
+    aligned.
+    """
+    from slam import monocular_scale as m
+
+    intr = CameraIntrinsics(fx=600.0, fy=600.0, cx=320.0, cy=240.0,
+                            width=640, height=480)
+    ref = MonocularScaleReference(intr, min_matches=6, min_shared=0, anchor=1.0)
+
+    n = 20
+    rng = np.random.default_rng(3)
+    uv = rng.uniform(20, 600, (n, 2)).astype(np.float64)
+    ids = np.arange(n)
+
+    # Pose stub: identity rotation, unit +X baseline, every match an inlier.
+    monkeypatch.setattr(m, "estimate_relative_pose",
+                        lambda a, b, K: (np.eye(3), np.array([1.0, 0.0, 0.0]),
+                                         np.ones(n, dtype=bool)))
+
+    # Triangulation stub: valid depths for all, but the cheirality mask drops the
+    # last 5 — so pts_a[valid] (and metric_cur) are shorter than the inlier set.
+    def fake_triangulate(uv_a, uv_b, K, R, t):
+        pts = np.column_stack([uv_a, np.full(len(uv_a), 2.0)])   # z = 2 m
+        valid = np.ones(len(uv_a), dtype=bool)
+        valid[-5:] = False
+        return pts, valid
+    monkeypatch.setattr(m, "triangulate_two_view", fake_triangulate)
+
+    depth_map = np.ones((480, 640))
+    pred_values, metric_cur = ref._geometry_step(uv, uv, ids, ids, depth_map)
+    assert len(pred_values) == len(metric_cur) == n - 5   # the invariant that broke
+
+
 def test_monocular_reference_first_frame_returns_none():
     intr = CameraIntrinsics(fx=600.0, fy=600.0, cx=320.0, cy=240.0,
                             width=640, height=480)
