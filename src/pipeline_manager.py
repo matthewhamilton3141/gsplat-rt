@@ -925,6 +925,23 @@ class PipelineManager:
             logger.exception("PLY write failed")
         return True
 
+    def _mean_camera_up(self) -> Optional[np.ndarray]:
+        """Mean camera-up over the keyframe trajectory, for upright previews.
+
+        Each keyframe pose is a 4x4 camera-to-world; the camera's up in world is
+        ``-R[:, 1]`` (OpenCV convention, +Y down). Averaging over the trajectory
+        gives the preview a stable 'which way is up' hint (see
+        ``visualization.estimate_up``). Returns None when no posed keyframes exist
+        (fixed-camera runs) so the preview falls back to point-only estimation.
+        """
+        ups = [-np.asarray(pose)[:3, 1] for _rgb, pose in list(self._keyframes)
+               if pose is not None]
+        if not ups:
+            return None
+        u = np.mean(ups, axis=0)
+        n = np.linalg.norm(u)
+        return None if n < 1e-9 else (u / n)
+
     def _write_previews(self) -> None:
         """Write the 2-D occupancy map + splat preview PNGs.
 
@@ -954,12 +971,13 @@ class PipelineManager:
             # Only pair colours when they line up 1:1 with positions (the deques
             # can be mid-extend); otherwise fall back to the depth ramp.
             cols = colors if len(colors) == len(positions) else None
+            cam_up = self._mean_camera_up()                # upright hint, or None
             if positions:
                 w, h = self._config.depth_input_w, self._config.depth_input_h
                 save_points_preview(positions, self.points_png_path,
-                                    width=w, height=h, colors=cols)
+                                    width=w, height=h, colors=cols, cam_up=cam_up)
                 save_splat_preview(positions, self.preview_png_path,
-                                   width=w, height=h, colors=cols)
+                                   width=w, height=h, colors=cols, cam_up=cam_up)
         except Exception:
             logger.exception("Preview PNG write failed")
 

@@ -133,35 +133,144 @@ def _prep_points(
     return pts, col
 
 
+# Fallback "up": the camera-convention up (screen-up) when no better signal
+# exists — v grows downward, so scene-up points toward -Y.
+_FALLBACK_UP = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    return np.asarray(v, dtype=np.float64) / (np.linalg.norm(v) + 1e-12)
+
+
+def estimate_up(
+    points: Sequence[Sequence[float]],
+    cam_up: Optional[Sequence[float]] = None,
+    max_points: int = 60_000,
+) -> np.ndarray:
+    """Estimate the scene's up direction so a preview can render it level.
+
+    Adapted from lingbot-desktop-mac's presentation.estimate_up. Two signals:
+    - ``cam_up`` (optional): the mean camera-up across the trajectory
+      (``-R[:,1]`` per pose, OpenCV c2w) — the pipeline can supply this. Used as
+      the primary estimate and the sign reference.
+    - a RANSAC **ground/dominant-plane** fit on the cloud (the desk surface, a
+      floor): its normal. With ``cam_up`` we fit on the low band and only adopt
+      the plane if it broadly agrees; without it the dominant plane normal *is*
+      the up estimate (great for a desk — you then view down onto the surface).
+
+    Deterministic (seeded). Returns a unit 3-vector.
+    """
+    P = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    P = P[np.isfinite(P).all(axis=1)]
+    ref = _normalize(cam_up) if cam_up is not None else None
+    if P.shape[0] < 500:
+        return ref if ref is not None else _FALLBACK_UP.copy()
+    if P.shape[0] > max_points:
+        P = P[:: max(1, P.shape[0] // max_points)]
+
+    # A length scale for the inlier threshold (bbox diagonal).
+    diag = float(np.linalg.norm(P.max(0) - P.min(0))) or 1.0
+    thresh = 0.01 * diag
+
+    # errstate mutes the spurious float BLAS subnormal warnings on macOS Accelerate.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        # Candidate ground points: the low band along cam_up if we have it, else all.
+        if ref is not None:
+            h = P @ ref
+            band = P[h < np.percentile(h, 30.0)]
+        else:
+            band = P
+        if band.shape[0] < 300:
+            return ref if ref is not None else _FALLBACK_UP.copy()
+
+        rng = np.random.default_rng(0)
+        best_n, best_inliers = None, 0
+        for _ in range(250):
+            idx = rng.choice(band.shape[0], 3, replace=False)
+            p0, p1, p2 = band[idx]
+            n = np.cross(p1 - p0, p2 - p0)
+            norm = np.linalg.norm(n)
+            if norm < 1e-9:
+                continue
+            n = n / norm
+            inliers = int((np.abs((band - p0) @ n) < thresh).sum())
+            if inliers > best_inliers:
+                best_inliers, best_n = inliers, n
+
+    if best_n is None:
+        return ref if ref is not None else _FALLBACK_UP.copy()
+
+    # Orient the normal toward the reference (cam_up, or the fallback up).
+    sign_ref = ref if ref is not None else _FALLBACK_UP
+    n = best_n if float(np.dot(best_n, sign_ref)) >= 0 else -best_n
+    if ref is None:
+        return n                                          # plane normal is the up
+    ratio = best_inliers / band.shape[0]
+    if float(np.dot(n, ref)) > np.cos(np.deg2rad(40.0)) and ratio > 0.22:
+        return n                                          # plane refined cam_up
+    return ref
+
+
 def _auto_frame_project(
     points: Sequence[Sequence[float]],
     width: int,
     height: int,
+    up: Optional[Sequence[float]] = None,
+    cam_up: Optional[Sequence[float]] = None,
+    elevation_deg: float = 40.0,
     fill: float = 0.85,
 ):
-    """Fit a virtual pinhole to the cloud and project it to fill the frame.
+    """Fit an upright virtual camera to the cloud and project it to fill the frame.
 
-    Places the camera behind (in front of, in +Z terms) the nearest points,
-    centred on the cloud's median, and picks an isotropic focal length so the
-    lateral extent spans ``fill`` of the frame. Returns ``(u, v, z, mask)`` where
-    ``u, v`` are float pixel coords of the on-screen points, ``z`` their
-    virtual-camera depth, and ``mask`` the boolean selector back into ``points``
-    (so a parallel colour array can be subset identically). Returns None when the
-    cloud is empty or nothing lands on screen.
+    Estimates the scene up (or uses the caller's ``up``/``cam_up``), then looks at
+    the cloud centroid from an elevated 3/4 viewpoint with that up as vertical — so
+    the scene renders level and consistently oriented instead of at whatever random
+    tilt the world frame happened to have. The azimuth is pinned to the cloud's
+    dominant horizontal axis so the same scene always frames the same way. An
+    isotropic focal length makes the projected extent span ``fill`` of the frame.
+
+    Returns ``(u, v, z, mask)`` — float pixel coords, camera depth, and the
+    boolean selector back into ``points`` (so a parallel colour array subsets
+    identically). None when the cloud is empty or nothing lands on screen.
     """
-    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     if pts.shape[0] == 0:
         return None
 
+    if up is not None:
+        up_v = _normalize(up)
+    else:
+        up_v = _normalize(estimate_up(pts, cam_up=cam_up))
+
     centre = np.median(pts, axis=0)
-    x = pts[:, 0] - centre[0]
-    y = pts[:, 1] - centre[1]
-    zc = pts[:, 2]
+    Q = pts - centre
+
+    # errstate mutes the spurious float BLAS subnormal warnings on macOS Accelerate.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        # Dominant horizontal axis (in the plane ⟂ up) → a stable azimuth.
+        Qh = Q - np.outer(Q @ up_v, up_v)
+        if Qh.shape[0] >= 2 and np.any(np.abs(Qh) > 1e-9):
+            # principal direction = top eigenvector of the horizontal covariance
+            w, V = np.linalg.eigh(Qh.T @ Qh)
+            fwd_h = _normalize(V[:, int(np.argmax(w))])
+        else:
+            fwd_h = _normalize(np.cross(up_v, [1.0, 0.0, 0.0]) if abs(up_v[0]) < 0.9
+                               else np.cross(up_v, [0.0, 0.0, 1.0]))
+
+        # Camera looks toward the centroid from above the plane at `elevation_deg`.
+        e = np.deg2rad(elevation_deg)
+        view_dir = _normalize(np.cos(e) * fwd_h - np.sin(e) * up_v)  # forward (into scene)
+        right = _normalize(np.cross(view_dir, up_v))
+        true_up = _normalize(np.cross(right, view_dir))             # in-image up
+
+        x = Q @ right
+        y = -(Q @ true_up)                                          # image v grows down
+        zc = Q @ view_dir
 
     z_lo, z_hi = np.percentile(zc, [2.0, 98.0])
     depth_span = max(float(z_hi - z_lo), 1e-3)
-    z_cam = float(z_lo) - 0.30 * depth_span - 1e-3       # camera in front of all pts
-    z = zc - z_cam                                       # strictly > 0
+    z_cam = float(z_lo) - 0.30 * depth_span - 1e-3
+    z = zc - z_cam                                                # strictly > 0
 
     rx = float(np.percentile(np.abs(x), 98.0)) + 1e-6
     ry = float(np.percentile(np.abs(y), 98.0)) + 1e-6
@@ -211,6 +320,7 @@ def save_points_preview(
     colors: Optional[Sequence[Sequence[float]]] = None,
     point_radius: int = 2,
     max_points: int = 60_000,
+    cam_up: Optional[Sequence[float]] = None,
     background_bgr: tuple = (18, 18, 18),
 ) -> Optional[str]:
     """Auto-framed point-cloud preview: each Gaussian centre as a crisp dot.
@@ -227,9 +337,11 @@ def save_points_preview(
         Per-point RGB in [0, 1], parallel to ``points``.
     max_points : int
         Subsample to at most this many points before drawing (render speed).
+    cam_up : (3,) array-like, optional
+        Mean camera-up hint for upright orientation (see ``estimate_up``).
     """
     points, colors = _prep_points(points, colors, max_points)
-    proj = _auto_frame_project(points, width, height)
+    proj = _auto_frame_project(points, width, height, cam_up=cam_up)
     if proj is None:
         return None
     u, v, z, mask = proj
@@ -261,6 +373,7 @@ def save_splat_preview(
     splat_radius: int = 3,
     sigma: float = 1.6,
     max_points: int = 60_000,
+    cam_up: Optional[Sequence[float]] = None,
     background_bgr: tuple = (18, 18, 18),
 ) -> Optional[str]:
     """Auto-framed splat preview: each Gaussian as a soft, alpha-composited blob.
@@ -279,9 +392,11 @@ def save_splat_preview(
         Gaussian falloff of the footprint, in pixels.
     max_points : int
         Subsample to at most this many points before drawing (render speed).
+    cam_up : (3,) array-like, optional
+        Mean camera-up hint for upright orientation (see ``estimate_up``).
     """
     points, colors = _prep_points(points, colors, max_points)
-    proj = _auto_frame_project(points, width, height)
+    proj = _auto_frame_project(points, width, height, cam_up=cam_up)
     if proj is None:
         return None
     u, v, z, mask = proj
