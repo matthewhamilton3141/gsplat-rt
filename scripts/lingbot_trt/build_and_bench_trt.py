@@ -32,12 +32,17 @@ def _trt_to_torch(trt, dt):
     }[dt]
 
 
-def build_engine(onnx_path: str, fp16: bool, workspace_gb: int, logger, trt) -> bytes:
+def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool,
+                 workspace_gb: int, logger, trt) -> bytes:
     builder = trt.Builder(logger)
     flags = 0
     ndcf = trt.NetworkDefinitionCreationFlag
     if hasattr(ndcf, "EXPLICIT_BATCH"):            # required TRT<10, harmless flag name
         flags |= 1 << int(ndcf.EXPLICIT_BATCH)
+    if strongly_typed:
+        if not hasattr(ndcf, "STRONGLY_TYPED"):
+            raise RuntimeError("STRONGLY_TYPED needs TensorRT 10+")
+        flags |= 1 << int(ndcf.STRONGLY_TYPED)
     network = builder.create_network(flags)
     parser = trt.OnnxParser(network, logger)
     with open(onnx_path, "rb") as f:
@@ -47,9 +52,13 @@ def build_engine(onnx_path: str, fp16: bool, workspace_gb: int, logger, trt) -> 
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
-    if fp16 and hasattr(trt.BuilderFlag, "FP16"):
+    if strongly_typed:
+        # Precision comes from the (fp16) ONNX's own dtypes — no builder flag, no
+        # boundary cast nodes. Requires a true fp16 ONNX (export_probe --half).
+        print("[trt] precision: STRONGLY-TYPED (from the fp16 ONNX's dtypes)")
+    elif fp16 and hasattr(trt.BuilderFlag, "FP16"):
         config.set_flag(trt.BuilderFlag.FP16)
-        print("[trt] precision: FP16 (weakly-typed flag; internals in fp16)")
+        print("[trt] precision: FP16 (weakly-typed flag; internals in fp16, fp32 I/O)")
     else:
         print("[trt] precision: FP32/TF32")
 
@@ -67,6 +76,8 @@ def main() -> int:
     ap.add_argument("--onnx", required=True)
     ap.add_argument("--engine-out", default=None, help="save the serialized engine here")
     ap.add_argument("--no-fp16", action="store_true", help="build FP32/TF32 instead of FP16")
+    ap.add_argument("--strongly-typed", action="store_true",
+                    help="precision from the ONNX dtypes (use with a fp16 ONNX; no cast nodes)")
     ap.add_argument("--workspace-gb", type=int, default=8)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=50)
@@ -81,7 +92,8 @@ def main() -> int:
         return 2
 
     logger = trt.Logger(trt.Logger.WARNING)
-    engine_bytes = build_engine(args.onnx, not args.no_fp16, args.workspace_gb, logger, trt)
+    engine_bytes = build_engine(args.onnx, not args.no_fp16, args.strongly_typed,
+                                args.workspace_gb, logger, trt)
     if args.engine_out:
         with open(args.engine_out, "wb") as f:
             f.write(engine_bytes)
