@@ -95,6 +95,25 @@ def save_occupancy_png(
     return path
 
 
+def _decimate(
+    points: Sequence[Sequence[float]],
+    colors: Optional[Sequence[Sequence[float]]],
+    max_points: int,
+):
+    """Cap the drawn point count so a large accumulation buffer stays fast to
+    render. Uniform random subsample (fixed seed → stable across export ticks),
+    keeping ``colors`` in lockstep. Returns ``(pts, colors)`` as arrays."""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    col = None if colors is None else np.asarray(colors, dtype=np.float32).reshape(-1, 3)
+    if col is not None and col.shape[0] != pts.shape[0]:
+        col = None                                   # misaligned → drop, use ramp
+    if max_points and pts.shape[0] > max_points:
+        idx = np.random.default_rng(0).choice(pts.shape[0], max_points, replace=False)
+        pts = pts[idx]
+        col = None if col is None else col[idx]
+    return pts, col
+
+
 def _auto_frame_project(
     points: Sequence[Sequence[float]],
     width: int,
@@ -172,6 +191,7 @@ def save_points_preview(
     height: int = 518,
     colors: Optional[Sequence[Sequence[float]]] = None,
     point_radius: int = 2,
+    max_points: int = 60_000,
     background_bgr: tuple = (18, 18, 18),
 ) -> Optional[str]:
     """Auto-framed point-cloud preview: each Gaussian centre as a crisp dot.
@@ -186,7 +206,10 @@ def save_points_preview(
         World- (or camera-) space XYZ; the frame is fitted to them automatically.
     colors : (N, 3) array-like, optional
         Per-point RGB in [0, 1], parallel to ``points``.
+    max_points : int
+        Subsample to at most this many points before drawing (render speed).
     """
+    points, colors = _decimate(points, colors, max_points)
     proj = _auto_frame_project(points, width, height)
     if proj is None:
         return None
@@ -218,6 +241,7 @@ def save_splat_preview(
     colors: Optional[Sequence[Sequence[float]]] = None,
     splat_radius: int = 3,
     sigma: float = 1.6,
+    max_points: int = 60_000,
     background_bgr: tuple = (18, 18, 18),
 ) -> Optional[str]:
     """Auto-framed splat preview: each Gaussian as a soft, alpha-composited blob.
@@ -234,7 +258,10 @@ def save_splat_preview(
         Footprint half-width in pixels (kernel is ``2r+1`` square).
     sigma : float
         Gaussian falloff of the footprint, in pixels.
+    max_points : int
+        Subsample to at most this many points before drawing (render speed).
     """
+    points, colors = _decimate(points, colors, max_points)
     proj = _auto_frame_project(points, width, height)
     if proj is None:
         return None

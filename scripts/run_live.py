@@ -52,6 +52,9 @@ def main() -> int:
     ap.add_argument("--refresh", type=float, default=0.5, help="dashboard refresh period (s)")
     ap.add_argument("--loop", action="store_true", help="rewind a file source at its end (endless source)")
     ap.add_argument("--realtime", action="store_true", help="play a file at its frame rate, not disk speed")
+    ap.add_argument("--max-splats", type=int, default=150_000,
+                    help="ring-buffer cap on accumulated splat centres — how much "
+                         "of a moving trajectory the previews/USD retain (default 150k)")
 
     # --- M6 pose tracking (visual odometry front-end) ---
     ap.add_argument("--pose-tracking", choices=["none", "orb", "superpoint"], default="none",
@@ -123,6 +126,7 @@ def main() -> int:
         metric_scale_anchor=args.metric_scale_anchor,
         camera_intrinsics=cam_intr,
         camera_intrinsics_hw=cam_hw,
+        max_gaussians_export=args.max_splats,
     )
 
     manager = PipelineManager(cfg)

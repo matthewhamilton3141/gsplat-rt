@@ -78,8 +78,13 @@ class PipelineConfig:
     realtime_source: bool = False
     """Pace a file source to its frame rate instead of reading at disk speed."""
 
-    max_gaussians_export: int = 5_000
-    """Maximum Gaussian splat centres kept in the ring buffer."""
+    max_gaussians_export: int = 150_000
+    """Maximum Gaussian splat centres kept in the ring buffer. This is a ring:
+    once full it evicts the oldest points, so it also sets how much of a moving
+    trajectory the previews/USD accumulate. At 5k it held only ~4 frames of a
+    16-stride 518² sub-sample (~1089 pts/frame) — a moving camera then showed just
+    the latest sliver. 150k keeps ~130 frames, enough for a full desk sweep; the
+    previews decimate for render speed so the buffer size doesn't slow them."""
 
     tsdf_voxel_size: float = 0.05
     """TSDF voxel edge length in metres."""
