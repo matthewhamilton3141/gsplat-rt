@@ -8,6 +8,11 @@ NVIDIA A10G via ONNX export + TensorRT, and report **measured** numbers only.
 All figures below were reproduced on the box; nothing is assumed. Tooling is in this
 directory (`export_probe.py`, `build_and_bench_trt.py`).
 
+![LingBot-Map reconstruction — dense point cloud + solved camera trajectory](lingbot_reconstruction.png)
+
+*LingBot-Map's Stage-0 output on the A10G: a handheld desk clip reconstructed into a
+dense point cloud with the solved camera trajectory (frustums), rendered in viser.*
+
 ## Environment
 - **GPU:** NVIDIA A10G (Ampere, sm86), 22.5 GB usable, driver CUDA 13.2
 - **Stack:** isolated `uv` venv, PyTorch (cu128), TensorRT 10.x, onnxruntime; **no

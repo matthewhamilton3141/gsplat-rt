@@ -93,6 +93,13 @@ python scripts/eval_odometry.py --frontend superpoint --provider tensorrt   # 3.
 - **Gaussian optimizer** — a differentiable 3DGS rasterizer with hand-derived analytic gradients (finite-difference verified), the full `(1−λ)L1 + λ D-SSIM` loss, and Adaptive Density Control; runs as an offline finalize stage exporting optimized `.ply` splats. → [`docs/gaussian_optimizer.md`](docs/gaussian_optimizer.md)
 - **Visualization + export** — OpenUSD `.usdz` (splats + collision proxy), 2-D occupancy/splat previews, and browser viewers (stdlib Three.js viewer + an optional viser viewer with auto-upright framing).
 
+**Measured SLAM accuracy** — estimated trajectory (orange) vs TUM fr1/desk ground truth (green):
+
+| ORB + PnP | SuperPoint + LightGlue |
+|:---:|:---:|
+| ![ORB + PnP visual-odometry trajectory](docs/odometry_orb.png) | ![SuperPoint + LightGlue visual-odometry trajectory](docs/odometry_superpoint_lightglue.png) |
+| 5.7 cm ATE | **3.6 cm ATE** (3.5 cm via TensorRT) |
+
 ## Testing & reliability
 
 177 tests (pytest); GPU- and dataset-dependent rows skip cleanly off-box. The pipeline degrades gracefully by design — no CUDA/TensorRT falls back to numpy + a mock depth estimator, so the full system runs and is verifiable on a CPU-only laptop. Numerics are held to references (CUDA TSDF bit-for-bit vs a CPU oracle; analytic gradients vs finite differences). Full performance table + test matrix: [`docs/benchmarks.md`](docs/benchmarks.md).
