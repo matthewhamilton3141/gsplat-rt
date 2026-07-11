@@ -112,7 +112,7 @@ python scripts/eval_odometry.py --frontend superpoint --provider tensorrt   # 3.
 
 ## Related experiments
 
-- **LingBot-Map → TensorRT** — a separate optimization study taking a VGGT-style streaming reconstruction model to TensorRT (1.76× FP16 per block, with an honest INT8 negative result). See [`scripts/lingbot_trt/RESULTS.md`](scripts/lingbot_trt/RESULTS.md).
+- **LingBot-Map → TensorRT** — a separate optimization study taking a VGGT-style streaming reconstruction foundation model to TensorRT. Measured **1.76× FP16 per block** (kernel fusion at equal precision), an honest INT8 negative result, and a full **end-to-end integration** swapping all 24 aggregator blocks that quantifies why the per-block win *doesn't* translate whole-model (~1.08×) — the frame blocks aren't the bottleneck. Getting a correct number took dynamic-batch optimization profiles, current-stream execution (fixing a precision-independent NaN race), autocast mixed-precision matching, and shared TRT device memory. See [`scripts/lingbot_trt/RESULTS.md`](scripts/lingbot_trt/RESULTS.md).
 
 ## Tech stack
 
