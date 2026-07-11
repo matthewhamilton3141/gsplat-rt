@@ -56,6 +56,67 @@ def fuse(ds, use_pose, frame_stride, pixel_stride):
     return np.concatenate(clouds, axis=0)
 
 
+def backproject_colored(depth, rgb, K, pose, pixel_stride):
+    """Like ``backproject`` but also samples per-point colour.
+
+    Returns ``(pts float32 (M,3) world, colors uint8 (M,3) RGB)`` — ``rgb`` is the
+    OpenCV BGR frame, converted to RGB here.
+    """
+    H, W = depth.shape
+    vs, us = np.mgrid[0:H:pixel_stride, 0:W:pixel_stride]
+    z = depth[vs, us].ravel()
+    us, vs = us.ravel(), vs.ravel()
+    valid = z > 0.1
+    z, us, vs = z[valid], us[valid], vs[valid]
+    x = (us - K.cx) * z / K.fx
+    y = (vs - K.cy) * z / K.fy
+    pts = np.stack([x, y, z], axis=-1).astype(np.float32)       # camera frame
+    if pose is not None:
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            pts = pts @ pose[:3, :3].T + pose[:3, 3]            # -> world
+    colors = rgb[vs, us][:, ::-1].astype(np.uint8)             # BGR -> RGB
+    return pts, colors
+
+
+def fuse_colored(ds, frame_stride, pixel_stride):
+    """Ground-truth-pose fused cloud with per-point colour: (pts, colors)."""
+    pts_all, col_all = [], []
+    for f in list(ds)[::frame_stride]:
+        p, c = backproject_colored(f.load_depth(), f.load_rgb(), ds.intrinsics,
+                                   f.pose, pixel_stride)
+        pts_all.append(p)
+        col_all.append(c)
+    return np.concatenate(pts_all, axis=0), np.concatenate(col_all, axis=0)
+
+
+def write_ply_xyzrgb(path, pts, colors):
+    """Write a binary_little_endian coloured point cloud (x y z + red green blue).
+
+    Matches the plain-cloud branch of ``viz.scene_source.read_ply`` (float32 xyz +
+    uchar rgb, itemsize 15), so ``scripts/view_scene.py --ply`` renders it directly.
+    """
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
+    colors = np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+    n = pts.shape[0]
+    dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                   ("red", "u1"), ("green", "u1"), ("blue", "u1")])   # packed, 15 B
+    arr = np.empty(n, dt)
+    arr["x"], arr["y"], arr["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
+    arr["red"], arr["green"], arr["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        "end_header\n"
+    ).encode("ascii")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(header)
+        fh.write(arr.tobytes())
+    return path
+
+
 def topdown_image(pts, size=480, pad=0.1):
     """Orthographic top-down density render, coloured by height.
 
@@ -92,6 +153,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq", default="data/tum/rgbd_dataset_freiburg1_desk")
     ap.add_argument("--out", default="output/tum_recon.png")
+    ap.add_argument("--ply", default=None,
+                    help="also export a GT-pose-fused, RGB-coloured .ply "
+                         "(view with scripts/view_scene.py --ply)")
+    ap.add_argument("--no-topdown", action="store_true",
+                    help="skip the top-down comparison PNG (e.g. when only the .ply is wanted)")
     ap.add_argument("--frame-stride", type=int, default=3)
     ap.add_argument("--pixel-stride", type=int, default=4)
     args = ap.parse_args()
@@ -101,19 +167,26 @@ def main():
     print(f"Loaded {len(ds)} associated frames from {os.path.basename(args.seq)}; "
           f"fusing {n_used} (stride {args.frame_stride}).")
 
-    ident = fuse(ds, False, args.frame_stride, args.pixel_stride)
-    gt = fuse(ds, True, args.frame_stride, args.pixel_stride)
-    print(f"identity cloud: {len(ident):,} pts   gt cloud: {len(gt):,} pts")
-    print(f"gt world extent (m): {np.round(gt.max(0) - gt.min(0), 2)}")
+    if args.ply:
+        pts, colors = fuse_colored(ds, args.frame_stride, args.pixel_stride)
+        write_ply_xyzrgb(args.ply, pts, colors)
+        print(f"gt world extent (m): {np.round(pts.max(0) - pts.min(0), 2)}")
+        print(f"Wrote {args.ply}  ({len(pts):,} coloured points)")
 
-    size = 480
-    left = label(topdown_image(ident, size), "identity pose (current)")
-    right = label(topdown_image(gt, size), "ground-truth pose (M6)")
-    combo = np.hstack([left, np.full((size, 4, 3), 60, np.uint8), right])
+    if not args.no_topdown:
+        ident = fuse(ds, False, args.frame_stride, args.pixel_stride)
+        gt = fuse(ds, True, args.frame_stride, args.pixel_stride)
+        print(f"identity cloud: {len(ident):,} pts   gt cloud: {len(gt):,} pts")
+        print(f"gt world extent (m): {np.round(gt.max(0) - gt.min(0), 2)}")
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    cv2.imwrite(args.out, combo)
-    print(f"Wrote {args.out}")
+        size = 480
+        left = label(topdown_image(ident, size), "identity pose (current)")
+        right = label(topdown_image(gt, size), "ground-truth pose (M6)")
+        combo = np.hstack([left, np.full((size, 4, 3), 60, np.uint8), right])
+
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        cv2.imwrite(args.out, combo)
+        print(f"Wrote {args.out}")
 
 
 if __name__ == "__main__":
