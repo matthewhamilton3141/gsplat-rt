@@ -413,22 +413,33 @@ def main() -> int:
     print(f"baseline whole-model: {base_fps:.3f} fps")
 
     # --- build engines + swap every frame block --------------------------------
+    # Two phases so the build-time autotuner isn't starved by resident engine
+    # contexts. Phase 1 builds+caches every engine with NO context deserialized (only
+    # the 4.4 GB model resident); phase 2 loads the cached engines into swapped blocks.
+    # (Weakly-typed builds probe fp32 + bf16 tactics and OOM if contexts pile up.)
     n_swap = n_blocks if args.max_blocks <= 0 else min(args.max_blocks, n_blocks)
-    trt_blocks = []
+    per_block = []
+    print("\n== phase 1: build + cache every frame-block engine ==")
     for i in range(n_swap):
         slots, tensors = _slots_and_tensors(_CAPTURE[i]["args"], _CAPTURE[i]["kwargs"])
         in_shapes = [tuple(t.shape) for t in tensors]
-        eng = _export_and_build(i, frame_blocks[i], slots, tensors, max_batch,
+        _export_and_build(i, frame_blocks[i], slots, tensors, max_batch,
+                          args.precision, args.weakly_typed, args.engine_dir,
+                          args.opset, args.workspace_gb, logger, trt)
+        per_block.append((slots, in_shapes))
+        torch.cuda.empty_cache()          # drop the export deepcopy before the next build
+
+    print("\n== phase 2: load cached engines into swapped blocks ==")
+    trt_blocks = []
+    for i in range(n_swap):
+        slots, in_shapes = per_block[i]
+        eng = _export_and_build(i, frame_blocks[i], slots, None, max_batch,
                                 args.precision, args.weakly_typed, args.engine_dir,
-                                args.opset, args.workspace_gb, logger, trt)
+                                args.opset, args.workspace_gb, logger, trt)  # cache hit
         tb = _make_trt_block(frame_blocks[i], eng, slots, in_shapes, max_batch,
                              _CAPTURE[i]["out"], trt, logger)
         frame_blocks[i] = tb
         trt_blocks.append(tb)
-        # release the per-block export deepcopy + fragmentation so the next build's
-        # autotuner has room (weakly-typed builds probe fp32 + bf16 tactics and OOM
-        # otherwise, with the 4.4 GB model + prior engine contexts resident).
-        torch.cuda.empty_cache()
     print(f"\nswapped {n_swap}/{n_blocks} frame blocks -> TRT {args.precision}")
 
     # --- per-block self-check: engine vs orig on the block's OWN captured input --
