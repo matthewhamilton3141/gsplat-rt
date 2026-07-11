@@ -420,7 +420,9 @@ def main() -> int:
     worst, worst_i, sc_nonfinite = 0.0, -1, 0
     for i, tb in enumerate(trt_blocks):
         a, kw = _CAPTURE[i]["args"], _CAPTURE[i]["kwargs"]
-        with torch.no_grad():
+        # the reference must run under the same autocast the baseline used — the block
+        # is mixed-precision (bf16 matmuls, fp32 LayerNorm/softmax), not pure bf16.
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             ref = _flatten_tensors(tb.orig(*a, **kw))
             got = _flatten_tensors(tb(*a, **kw))
         torch.cuda.synchronize()
