@@ -22,14 +22,17 @@ import numpy as np
 
 def _trt_to_torch(trt, dt):
     import torch
-    return {
+    m = {
         trt.DataType.FLOAT: torch.float32,
         trt.DataType.HALF: torch.float16,
         trt.DataType.INT64: torch.int64,
         trt.DataType.INT32: torch.int32,
         trt.DataType.BOOL: torch.bool,
         trt.DataType.INT8: torch.int8,
-    }[dt]
+    }
+    if hasattr(trt.DataType, "BF16"):                  # TRT 10+
+        m[trt.DataType.BF16] = torch.bfloat16
+    return m[dt]
 
 
 def make_calibrator(npz_path: str, cache_path: str, trt):

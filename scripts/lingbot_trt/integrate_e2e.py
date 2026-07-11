@@ -156,17 +156,21 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_templat
 # Per-block ONNX export + engine build (fp16, strongly-typed)
 # ---------------------------------------------------------------------------
 
-def _export_and_build(idx, block, slots, tensors, max_batch, engine_dir, opset,
-                      workspace_gb, logger, trt):
-    """Export block `idx` to a true-fp16 ONNX (dynamic batch dim) and build a
-    strongly-typed fp16 engine with a batch-1..max_batch optimization profile.
+def _export_and_build(idx, block, slots, tensors, max_batch, precision, engine_dir,
+                      opset, workspace_gb, logger, trt):
+    """Export block `idx` to a true-`precision` ONNX (dynamic batch dim) and build a
+    strongly-typed engine with a batch-1..max_batch optimization profile. `precision`
+    is "bf16" or "fp16". bf16 matches the aggregator's own dtype so inter-block
+    activations don't overflow (fp16 caps at 65504 -> Inf/NaN end-to-end).
     Returns engine bytes. Caches both artefacts under engine_dir."""
     import torch
 
     # ".dyn" so these dynamic-batch artefacts never collide with Stage-4's earlier
     # static-shape cache (a stale static engine would reject set_input_shape).
-    onnx_path = os.path.join(engine_dir, f"frame_block{idx}.fp16.dyn.onnx")
-    eng_path = os.path.join(engine_dir, f"frame_block{idx}.fp16.dyn.engine")
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
+    # precision + ".dyn" in the name so bf16 / fp16 / earlier static caches never mix.
+    onnx_path = os.path.join(engine_dir, f"frame_block{idx}.{precision}.dyn.onnx")
+    eng_path = os.path.join(engine_dir, f"frame_block{idx}.{precision}.dyn.engine")
     if os.path.exists(eng_path):
         with open(eng_path, "rb") as f:
             print(f"[block {idx}] loaded cached engine {eng_path}")
@@ -174,16 +178,16 @@ def _export_and_build(idx, block, slots, tensors, max_batch, engine_dir, opset,
 
     # deepcopy so we never mutate the live (bf16) model — we still need it for the
     # baseline run and for the fallback path.
-    blk = copy.deepcopy(block).to(torch.float16).eval()
+    blk = copy.deepcopy(block).to(dtype).eval()
 
     def _cast(t):
-        return t.to(torch.float16) if (torch.is_tensor(t) and t.is_floating_point()) else t
+        return t.to(dtype) if (torch.is_tensor(t) and t.is_floating_point()) else t
 
-    # rebuild the exact captured call, cast float tensors to fp16, keep int index
+    # rebuild the exact captured call, cast float tensors to `dtype`, keep int index
     # tensors (RoPE `pos` indexes an embedding table — casting breaks F.embedding).
     a_full = [_cast(v) for v in _CAPTURE[idx]["args"]]
     kw_full = {k: _cast(v) for k, v in _CAPTURE[idx]["kwargs"].items()}
-    tin = [t.to(torch.float16) if t.is_floating_point() else t for t in tensors]
+    tin = [t.to(dtype) if t.is_floating_point() else t for t in tensors]
 
     class Wrapper(torch.nn.Module):
         def __init__(self, mod):
@@ -209,7 +213,7 @@ def _export_and_build(idx, block, slots, tensors, max_batch, engine_dir, opset,
     # it dynamic on every I/O so one engine covers batch 1..max_batch.
     dyn_axes = {n: {0: "batch"} for n in in_names + out_names}
 
-    print(f"[block {idx}] exporting fp16 ONNX (dynamic batch) -> {onnx_path}")
+    print(f"[block {idx}] exporting {precision} ONNX (dynamic batch) -> {onnx_path}")
     torch.onnx.export(wrapper, tuple(tin), onnx_path, input_names=in_names,
                       output_names=out_names, opset_version=opset,
                       do_constant_folding=True, dynamo=False, dynamic_axes=dyn_axes)
@@ -217,9 +221,10 @@ def _export_and_build(idx, block, slots, tensors, max_batch, engine_dir, opset,
                     (max_batch, *tuple(t.shape[1:])),
                     (max_batch, *tuple(t.shape[1:])))
                 for n, t in zip(in_names, tin)}
-    engine_bytes = build_engine(onnx_path, fp16=True, strongly_typed=True, int8=False,
-                                calibrator=None, workspace_gb=workspace_gb,
-                                logger=logger, trt=trt, dynamic_profiles=profiles)
+    engine_bytes = build_engine(onnx_path, fp16=(precision == "fp16"),
+                                strongly_typed=True, int8=False, calibrator=None,
+                                workspace_gb=workspace_gb, logger=logger, trt=trt,
+                                dynamic_profiles=profiles)
     with open(eng_path, "wb") as f:
         f.write(engine_bytes)
     print(f"[block {idx}] engine saved -> {eng_path}")
@@ -299,6 +304,10 @@ def main() -> int:
                          "the heads from emitting NaN; falls back to random if missing)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--precision", choices=["bf16", "fp16"], default="bf16",
+                    help="engine precision. bf16 matches the aggregator's own dtype "
+                         "(no overflow); fp16 overflows end-to-end (Inf/NaN) because "
+                         "inter-block activations exceed fp16's 65504 range.")
     ap.add_argument("--opset", type=int, default=18)
     ap.add_argument("--workspace-gb", type=int, default=8)
     ap.add_argument("--max-blocks", type=int, default=0,
@@ -339,11 +348,16 @@ def main() -> int:
                 _CAPTURE.setdefault(idx, {})
                 if "args" not in _CAPTURE[idx]:
                     _CAPTURE[idx]["args"], _CAPTURE[idx]["kwargs"] = a, kw
+                fts = [v for v in list(a) + list(kw.values())
+                       if _t.is_tensor(v) and v.is_floating_point()]
                 # track the largest batch (dim 0) this block is ever called with, so
                 # the dynamic profile's max covers scale-frame / window / partial calls.
                 b = max((v.shape[0] for v in list(a) + list(kw.values())
                          if _t.is_tensor(v)), default=0)
                 _CAPTURE[idx]["max_batch"] = max(_CAPTURE[idx].get("max_batch", 0), b)
+                # peak input magnitude -> shows whether activations exceed fp16's 65504.
+                amax = max((float(v.abs().max()) for v in fts), default=0.0)
+                _CAPTURE[idx]["amax"] = max(_CAPTURE[idx].get("amax", 0.0), amax)
 
             def post(mod, a, kw, out):
                 _CAPTURE.setdefault(idx, {})
@@ -370,8 +384,12 @@ def main() -> int:
     shp0 = [tuple(t.shape) for t in _slots_and_tensors(_CAPTURE[0]["args"],
                                                        _CAPTURE[0]["kwargs"])[1]]
     max_batch = max(_CAPTURE[i]["max_batch"] for i in range(n_blocks))
+    peak_amax = max(_CAPTURE[i]["amax"] for i in range(n_blocks))
     print(f"block-0 tensor input shapes: {shp0}  (max batch seen across blocks: "
           f"{max_batch})")
+    print(f"peak frame-block input |activation| across blocks: {peak_amax:.1f}  "
+          f"(fp16 max = 65504 -> {'OVERFLOWS fp16' if peak_amax > 65504 else 'fits fp16'}; "
+          f"building {args.precision} engines)")
 
     # --- baseline (all-torch bf16) ---------------------------------------------
     print("\n== baseline (bf16 PyTorch) ==")
@@ -385,16 +403,16 @@ def main() -> int:
         slots, tensors = _slots_and_tensors(_CAPTURE[i]["args"], _CAPTURE[i]["kwargs"])
         in_shapes = [tuple(t.shape) for t in tensors]
         eng = _export_and_build(i, frame_blocks[i], slots, tensors, max_batch,
-                                args.engine_dir, args.opset, args.workspace_gb,
-                                logger, trt)
+                                args.precision, args.engine_dir, args.opset,
+                                args.workspace_gb, logger, trt)
         tb = _make_trt_block(frame_blocks[i], eng, slots, in_shapes, max_batch,
                              _CAPTURE[i]["out"], trt, logger)
         frame_blocks[i] = tb
         trt_blocks.append(tb)
-    print(f"\nswapped {n_swap}/{n_blocks} frame blocks -> TRT fp16")
+    print(f"\nswapped {n_swap}/{n_blocks} frame blocks -> TRT {args.precision}")
 
     # --- TRT run ---------------------------------------------------------------
-    print("\n== TRT (frame blocks fp16) ==")
+    print(f"\n== TRT (frame blocks {args.precision}) ==")
     trt_fps, trt_out = _time_inference(model, imgs, args, args.warmup, args.iters)
     hit = sum(b.n_trt for b in trt_blocks)
     fb = sum(b.n_fallback for b in trt_blocks)
