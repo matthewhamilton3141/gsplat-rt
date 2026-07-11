@@ -63,6 +63,31 @@ memory** across contexts, and the NaN-aware parity + per-block self-check harnes
   path as the engine; let the first window (empty cache) run in PyTorch (rare, cheap) —
   mirrors Stage 4's torch fallback for off-profile shapes.
 
+### Step 2 first pass — `export_global_block.py` (two-phase, box-only)
+Step 1.5 measured GO (`global_blocks` = **45.2%** of runtime; RESULTS.md). The export scaffold
+`scripts/lingbot_trt/export_global_block.py` runs in two phases so the cheap discovery is never
+lost to a wrapper bug:
+- **Phase 1 (always completes):** prints `inspect.getsource(type(block).forward)` + its source
+  file, the captured decode-call `(args, kwargs)`, the full `kv_cache` dict (per-key shape/dtype),
+  **which cache keys change across the call** (the slot this block writes), the output signature,
+  every complex tensor, and dumps the real I/O to `.npz`. This is what we still lack: the exact
+  `forward` body, the cache-return contract, and the RoPE application — none of it guessed.
+- **Phase 2 (attempt):** functional wrapper `f(tokens, cache_slot…, pos_real, pos_imag) ->
+  (out, new_cache…)`, complex `pos` split to real/imag at the boundary, classic-TorchScript
+  export. **Expected to fail on the complex RoPE op** — that error names the real-cos/sin refactor.
+
+First box run (discovery only, then attempt):
+```bash
+cd ~/lingbot-map && source .venv/bin/activate
+python ~/gsplat-rt/scripts/lingbot_trt/export_global_block.py \
+    --model_path checkpoints/lingbot-map-long.pt --lingbot-root ~/lingbot-map \
+    --index 0 --capture-call 1 --dump-io /tmp/gblock0_io.npz   # add --no-export for Phase 1 only
+```
+**Wrapper assumptions to confirm against the Phase-1 source dump** (fix before trusting Phase 2):
+the block reads/writes only its own slot inside the passed `kv_cache` dict (keyed by `global_idx`),
+and returns its main activation as the output. The probe showed the *same* full dict passed to all
+24 blocks → the cache is shared, per-block-keyed (`k_{idx}`/`v_{idx}` + `_special`).
+
 ## Step 3 — integrate + measure (honest)
 Same structure as Stage 4: swap all global blocks, verify with the self-check + NaN-aware
 end-to-end parity on **real** frames, and report whole-model fps vs the bf16 baseline.
