@@ -402,11 +402,24 @@ def main() -> int:
           f"(engine calls {hit}, torch fallbacks {fb})")
 
     # --- parity: compare the two full reconstructions --------------------------
+    # NaN-aware: report each side's non-finite counts (tells us whether a NaN comes
+    # from the baseline itself vs the fp16 TRT path) and measure the diff over the
+    # elements that are finite on BOTH sides.
     bt, tt = _flatten_tensors(base_out), _flatten_tensors(trt_out)
     if len(bt) == len(tt) and bt:
-        max_err = max(float((b.float() - t.float()).abs().max()) for b, t in zip(bt, tt))
-        rng = max(float(b.float().abs().max()) for b in bt) or 1.0
-        print(f"parity: max abs diff (baseline vs TRT) = {max_err:.3e}  "
+        b_bad = sum(int((~torch.isfinite(b)).sum()) for b in bt)
+        t_bad = sum(int((~torch.isfinite(t)).sum()) for t in tt)
+        n_tot = sum(b.numel() for b in bt)
+        max_err, rng = 0.0, 1.0
+        for b, t in zip(bt, tt):
+            bf, tf = b.float(), t.float()
+            m = torch.isfinite(bf) & torch.isfinite(tf)
+            if m.any():
+                max_err = max(max_err, float((bf[m] - tf[m]).abs().max()))
+                rng = max(rng, float(bf[m].abs().max()))
+        print(f"parity: baseline non-finite {b_bad}/{n_tot}, TRT non-finite "
+              f"{t_bad}/{n_tot}")
+        print(f"parity: max abs diff over finite elems = {max_err:.3e}  "
               f"(rel {max_err / rng:.2%})")
     else:
         print(f"parity: output structure differed ({len(bt)} vs {len(tt)} tensors)")
