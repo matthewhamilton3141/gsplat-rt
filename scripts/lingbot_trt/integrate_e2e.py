@@ -158,21 +158,29 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_templat
 # Per-block ONNX export + engine build (fp16, strongly-typed)
 # ---------------------------------------------------------------------------
 
-def _export_and_build(idx, block, slots, tensors, max_batch, precision, engine_dir,
-                      opset, workspace_gb, logger, trt):
-    """Export block `idx` to a true-`precision` ONNX (dynamic batch dim) and build a
-    strongly-typed engine with a batch-1..max_batch optimization profile. `precision`
-    is "bf16" or "fp16". bf16 matches the aggregator's own dtype so inter-block
-    activations don't overflow (fp16 caps at 65504 -> Inf/NaN end-to-end).
+def _export_and_build(idx, block, slots, tensors, max_batch, precision, weakly_typed,
+                      engine_dir, opset, workspace_gb, logger, trt):
+    """Export block `idx` to a dynamic-batch ONNX and build an engine with a
+    batch-1..max_batch optimization profile. `precision` is "bf16" or "fp16".
+
+    Two build modes:
+    - strongly-typed (default): export a true-`precision` ONNX; every op runs at that
+      precision. Simple, but forces LayerNorm/softmax to low precision too, which the
+      model runs in fp32 under autocast -> ~14% end-to-end drift.
+    - weakly-typed (weakly_typed=True): export an fp32 ONNX and set the precision as a
+      builder *flag*; TRT keeps precision-sensitive layers in fp32 and matmuls in
+      bf16/fp16 — mirrors the model's autocast, so parity stays tight.
     Returns engine bytes. Caches both artefacts under engine_dir."""
     import torch
 
-    # ".dyn" so these dynamic-batch artefacts never collide with Stage-4's earlier
-    # static-shape cache (a stale static engine would reject set_input_shape).
-    dtype = torch.bfloat16 if precision == "bf16" else torch.float16
-    # precision + ".dyn" in the name so bf16 / fp16 / earlier static caches never mix.
-    onnx_path = os.path.join(engine_dir, f"frame_block{idx}.{precision}.dyn.onnx")
-    eng_path = os.path.join(engine_dir, f"frame_block{idx}.{precision}.dyn.engine")
+    # weakly-typed keeps the ONNX in fp32 (TRT picks per-layer precision); strongly-typed
+    # bakes the target dtype into the ONNX itself.
+    dtype = (torch.float32 if weakly_typed else
+             (torch.bfloat16 if precision == "bf16" else torch.float16))
+    # tag encodes precision + mode + ".dyn" so no two caches ever collide.
+    tag = f"{precision}{'w' if weakly_typed else ''}.dyn"
+    onnx_path = os.path.join(engine_dir, f"frame_block{idx}.{tag}.onnx")
+    eng_path = os.path.join(engine_dir, f"frame_block{idx}.{tag}.engine")
     if os.path.exists(eng_path):
         with open(eng_path, "rb") as f:
             print(f"[block {idx}] loaded cached engine {eng_path}")
@@ -215,7 +223,7 @@ def _export_and_build(idx, block, slots, tensors, max_batch, precision, engine_d
     # it dynamic on every I/O so one engine covers batch 1..max_batch.
     dyn_axes = {n: {0: "batch"} for n in in_names + out_names}
 
-    print(f"[block {idx}] exporting {precision} ONNX (dynamic batch) -> {onnx_path}")
+    print(f"[block {idx}] exporting {tag} ONNX (dynamic batch) -> {onnx_path}")
     torch.onnx.export(wrapper, tuple(tin), onnx_path, input_names=in_names,
                       output_names=out_names, opset_version=opset,
                       do_constant_folding=True, dynamo=False, dynamic_axes=dyn_axes)
@@ -224,9 +232,10 @@ def _export_and_build(idx, block, slots, tensors, max_batch, precision, engine_d
                     (max_batch, *tuple(t.shape[1:])))
                 for n, t in zip(in_names, tin)}
     engine_bytes = build_engine(onnx_path, fp16=(precision == "fp16"),
-                                strongly_typed=True, int8=False, calibrator=None,
-                                workspace_gb=workspace_gb, logger=logger, trt=trt,
-                                dynamic_profiles=profiles)
+                                bf16=(precision == "bf16"),
+                                strongly_typed=not weakly_typed, int8=False,
+                                calibrator=None, workspace_gb=workspace_gb,
+                                logger=logger, trt=trt, dynamic_profiles=profiles)
     with open(eng_path, "wb") as f:
         f.write(engine_bytes)
     print(f"[block {idx}] engine saved -> {eng_path}")
@@ -307,9 +316,13 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--precision", choices=["bf16", "fp16"], default="bf16",
-                    help="engine precision. bf16 matches the aggregator's own dtype "
-                         "(no overflow); fp16 overflows end-to-end (Inf/NaN) because "
-                         "inter-block activations exceed fp16's 65504 range.")
+                    help="engine compute precision for matmuls. bf16 matches the "
+                         "aggregator's own dtype.")
+    ap.add_argument("--weakly-typed", action="store_true",
+                    help="build weakly-typed (fp32 ONNX + precision as a builder flag) "
+                         "so TRT keeps LayerNorm/softmax in fp32 like the model's "
+                         "autocast — tight parity. Default (off) is strongly-typed, "
+                         "which forces those ops to low precision (~14% drift).")
     ap.add_argument("--opset", type=int, default=18)
     ap.add_argument("--workspace-gb", type=int, default=8)
     ap.add_argument("--max-blocks", type=int, default=0,
@@ -389,9 +402,10 @@ def main() -> int:
     peak_amax = max(_CAPTURE[i]["amax"] for i in range(n_blocks))
     print(f"block-0 tensor input shapes: {shp0}  (max batch seen across blocks: "
           f"{max_batch})")
+    mode = f"{args.precision}{'-weak' if args.weakly_typed else '-strong'}"
     print(f"peak frame-block input |activation| across blocks: {peak_amax:.1f}  "
           f"(fp16 max = 65504 -> {'OVERFLOWS fp16' if peak_amax > 65504 else 'fits fp16'}; "
-          f"building {args.precision} engines)")
+          f"building {mode} engines)")
 
     # --- baseline (all-torch bf16) ---------------------------------------------
     print("\n== baseline (bf16 PyTorch) ==")
@@ -405,8 +419,8 @@ def main() -> int:
         slots, tensors = _slots_and_tensors(_CAPTURE[i]["args"], _CAPTURE[i]["kwargs"])
         in_shapes = [tuple(t.shape) for t in tensors]
         eng = _export_and_build(i, frame_blocks[i], slots, tensors, max_batch,
-                                args.precision, args.engine_dir, args.opset,
-                                args.workspace_gb, logger, trt)
+                                args.precision, args.weakly_typed, args.engine_dir,
+                                args.opset, args.workspace_gb, logger, trt)
         tb = _make_trt_block(frame_blocks[i], eng, slots, in_shapes, max_batch,
                              _CAPTURE[i]["out"], trt, logger)
         frame_blocks[i] = tb

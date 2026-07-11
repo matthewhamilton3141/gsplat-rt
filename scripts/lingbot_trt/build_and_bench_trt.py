@@ -76,7 +76,8 @@ def make_calibrator(npz_path: str, cache_path: str, trt):
 
 
 def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool, int8, calibrator,
-                 workspace_gb: int, logger, trt, dynamic_profiles=None) -> bytes:
+                 workspace_gb: int, logger, trt, dynamic_profiles=None,
+                 bf16: bool = False) -> bytes:
     """Build a serialized TensorRT engine from `onnx_path`.
 
     `dynamic_profiles`, if given, maps input name -> (min_shape, opt_shape, max_shape)
@@ -117,6 +118,10 @@ def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool, int8, calibra
         # Precision comes from the (fp16) ONNX's own dtypes — no builder flag, no
         # boundary cast nodes. Requires a true fp16 ONNX (export_probe --half).
         print("[trt] precision: STRONGLY-TYPED (from the fp16 ONNX's dtypes)")
+    elif bf16 and hasattr(trt.BuilderFlag, "BF16"):
+        config.set_flag(trt.BuilderFlag.BF16)
+        print("[trt] precision: BF16 (weakly-typed flag; TRT keeps precision-sensitive "
+              "layers e.g. LayerNorm/softmax in fp32, matmuls in bf16 — mirrors autocast)")
     elif fp16 and hasattr(trt.BuilderFlag, "FP16"):
         config.set_flag(trt.BuilderFlag.FP16)
         print("[trt] precision: FP16 (weakly-typed flag; internals in fp16, fp32 I/O)")
