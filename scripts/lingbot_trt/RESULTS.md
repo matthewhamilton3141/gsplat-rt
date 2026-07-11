@@ -143,11 +143,38 @@ Each of these was measured, not assumed — the naive swap was wrong in four sep
    28 GB > the A10G's 22.5 GB. The blocks run sequentially on one stream, so they share
    **one** device-memory scratch (sized to the largest engine) — 24×1.2 GB → 1×1.2 GB.
 
+## Stage 5, Step 1.5 — measured runtime split (the go/no-go gate)
+Before writing any `global_blocks` export, `runtime_split.py` CUDA-event-timed one real
+`inference_windowed` (48 frames, window 16, mean of 3 runs on the A10G) to settle where the
+time actually goes — a perfect block engine is worthless if it isn't the bottleneck (the
+Stage-4 lesson). And a **structure probe** (`probe_global_blocks.py`) first confirmed the KV
+cache is **functional** (passed as an arg, not mutating module state) → the cleanest export
+branch; the dynamic axis is the sequence/token length (prefill 8336 → decode 1042 tokens).
+
+| group | ms / windowed forward | share |
+|---|---|---|
+| **global_blocks** (KV-cache attention) | **2820.7** | **45.2%** |
+| frame_blocks (Stage-4 target) | 1398.2 | 22.4% |
+| heads (DPT depth + camera) | 1090.7 | 17.5% |
+| rest (patch embed / RoPE / norm / proj / overhead) | 937.5 | 15.0% |
+| **TOTAL** | **6247.1** | 100% |
+
+**Verdict: GO.** `global_blocks` are the single largest cost at **45.2%** — this is exactly
+why Stage 4's frame-block engine (22.4% of runtime) only moved the whole model ~1.08×. The
+honest Amdahl framing: a *perfect* (zero-cost) `global_blocks` caps whole-model at **1.82×**
+(6247 / 3426); at a Stage-4-like **1.76× per-block** kernel speedup the realistic whole-model
+gain is **~1.24×** (gb 2820→1603 ms), rising to ~1.43× if the cache engine hits 3×. So this
+is the first LingBot target with a defensible whole-model win — because it's where the time
+is, not just where the fusion looked good in isolation. (⚠ export snag noted for Step 2: `pos`
+is `complex128` RoPE — TRT/ONNX have no complex dtype, so RoPE must be applied as real cos/sin
+ops or precomputed outside the engine.)
+
 ## What's next (not done)
-- **The real target: the KV-cache `global_blocks`** (dynamic control flow). Stage 4
-  proves the frame blocks aren't where the time goes; the `global_blocks` + heads are.
-  That's the genuinely difficult export (stateful, data-dependent) and the only path to
-  a meaningful whole-model speedup.
+- **Build the `global_blocks` export** (Step 2, functional-cache branch): wrap as
+  `f(tokens, cached_k, cached_v, pos) -> (out, new_k, new_v)`, one engine with a dynamic
+  profile over the sequence axis, cache concat kept in Python; resolve the complex-RoPE
+  first. Then integrate + measure whole-model fps vs the bf16 baseline (Step 3), same
+  NaN-aware parity harness as Stage 4. Expectation: a real but bounded (~1.2–1.4×) win.
 
 ## Methodology (Stage 4, end-to-end)
 - **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
