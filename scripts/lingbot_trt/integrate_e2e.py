@@ -85,7 +85,7 @@ def _slots_and_tensors(args, kwargs):
 # ---------------------------------------------------------------------------
 
 def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_template,
-                    trt, logger):
+                    trt, logger, devmem=None):
     """Build an nn.Module that runs `engine_bytes` (a dynamic-batch fp16 engine) for
     the frame block. The batch dim (dim 0) is dynamic up to `max_batch`; the trailing
     dims are fixed. Falls back to `orig` (the real bf16 block) only when a call's
@@ -94,7 +94,23 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_templat
 
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(engine_bytes)
-    context = engine.create_execution_context()
+    if devmem is not None:
+        # user-managed device memory: all blocks share one scratch buffer (they run
+        # sequentially on one stream) so N contexts don't each allocate ~1.2 GB.
+        ptr, size = devmem
+        try:
+            context = engine.create_execution_context_without_device_memory()
+        except Exception:
+            context = engine.create_execution_context(
+                trt.ExecutionContextAllocationStrategy.USER_MANAGED)
+        try:
+            context.set_device_memory(ptr, size)      # TRT 10 v2 signature
+        except TypeError:
+            context.set_device_memory(ptr)            # older signature
+    else:
+        context = engine.create_execution_context()
+    if context is None:
+        raise RuntimeError("create_execution_context returned None (GPU OOM?)")
 
     in_names, out_names, in_dtypes, out_dtypes = [], [], [], []
     for i in range(engine.num_io_tensors):
@@ -430,14 +446,32 @@ def main() -> int:
         torch.cuda.empty_cache()          # drop the export deepcopy before the next build
 
     print("\n== phase 2: load cached engines into swapped blocks ==")
+    # Load every cached engine, then size ONE shared device-memory scratch to the
+    # largest engine. The blocks run sequentially on a single stream, so they can all
+    # reuse it — 24 own contexts (~1.2 GB each, weakly-typed fp32) would exceed the
+    # A10G's 22.5 GB.
+    runtime = trt.Runtime(logger)
+    eng_bytes, max_dm = [], 0
+    for i in range(n_swap):
+        slots, _ = per_block[i]
+        eb = _export_and_build(i, frame_blocks[i], slots, None, max_batch,
+                               args.precision, args.weakly_typed, args.engine_dir,
+                               args.opset, args.workspace_gb, logger, trt)  # cache hit
+        eng_bytes.append(eb)
+        e = runtime.deserialize_cuda_engine(eb)
+        max_dm = max(max_dm, getattr(e, "device_memory_size", 0))
+        del e
+    torch.cuda.empty_cache()
+    shared = torch.empty(max(max_dm, 1), dtype=torch.uint8, device="cuda")
+    print(f"shared TRT device memory: {max_dm / 1e6:.0f} MB (one buffer for all "
+          f"{n_swap} blocks)")
+
     trt_blocks = []
     for i in range(n_swap):
         slots, in_shapes = per_block[i]
-        eng = _export_and_build(i, frame_blocks[i], slots, None, max_batch,
-                                args.precision, args.weakly_typed, args.engine_dir,
-                                args.opset, args.workspace_gb, logger, trt)  # cache hit
-        tb = _make_trt_block(frame_blocks[i], eng, slots, in_shapes, max_batch,
-                             _CAPTURE[i]["out"], trt, logger)
+        tb = _make_trt_block(frame_blocks[i], eng_bytes[i], slots, in_shapes, max_batch,
+                             _CAPTURE[i]["out"], trt, logger,
+                             devmem=(shared.data_ptr(), shared.numel()))
         frame_blocks[i] = tb
         trt_blocks.append(tb)
     print(f"\nswapped {n_swap}/{n_blocks} frame blocks -> TRT {args.precision}")
