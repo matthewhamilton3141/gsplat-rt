@@ -95,7 +95,6 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_templat
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(engine_bytes)
     context = engine.create_execution_context()
-    stream = torch.cuda.Stream()
 
     in_names, out_names, in_dtypes, out_dtypes = [], [], [], []
     for i in range(engine.num_io_tensors):
@@ -142,9 +141,12 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_templat
                         for n, d in zip(out_names, out_dtypes)]
             for n, b in zip(out_names, out_bufs):
                 context.set_tensor_address(n, b.data_ptr())
-            with torch.cuda.stream(stream):
-                context.execute_async_v3(stream_handle=stream.cuda_stream)
-            stream.synchronize()
+            # Run on torch's CURRENT stream so the engine is ordered after the ops
+            # that produced `x` and before the ops that consume the output. A private
+            # stream races the model's default-stream work end-to-end (the input is
+            # read before it's ready) -> garbage/NaN, precision-independent.
+            stream = torch.cuda.current_stream()
+            context.execute_async_v3(stream_handle=stream.cuda_stream)
             outs = [b.to(td) for b, td in zip(out_bufs, out_tmpl_dtypes)]
             self.n_trt += 1
             return _rebuild(out_template, iter(outs))
@@ -410,6 +412,28 @@ def main() -> int:
         frame_blocks[i] = tb
         trt_blocks.append(tb)
     print(f"\nswapped {n_swap}/{n_blocks} frame blocks -> TRT {args.precision}")
+
+    # --- per-block self-check: engine vs orig on the block's OWN captured input --
+    # Synced, no cross-stream race and no per-window input variation -> isolates
+    # "is each engine numerically correct" from end-to-end swap/interaction issues.
+    print("\n== per-block self-check (engine vs orig on captured input) ==")
+    worst, worst_i, sc_nonfinite = 0.0, -1, 0
+    for i, tb in enumerate(trt_blocks):
+        a, kw = _CAPTURE[i]["args"], _CAPTURE[i]["kwargs"]
+        with torch.no_grad():
+            ref = _flatten_tensors(tb.orig(*a, **kw))
+            got = _flatten_tensors(tb(*a, **kw))
+        torch.cuda.synchronize()
+        for r, g in zip(ref, got):
+            rf, gf = r.float(), g.float()
+            sc_nonfinite += int((~torch.isfinite(gf)).sum())
+            m = torch.isfinite(rf) & torch.isfinite(gf)
+            if m.any():
+                d = float((rf[m] - gf[m]).abs().max())
+                if d > worst:
+                    worst, worst_i = d, i
+    print(f"self-check: worst per-block max abs diff = {worst:.3e} (block {worst_i}), "
+          f"TRT non-finite = {sc_nonfinite}")
 
     # --- TRT run ---------------------------------------------------------------
     print(f"\n== TRT (frame blocks {args.precision}) ==")
