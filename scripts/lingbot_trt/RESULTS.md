@@ -90,18 +90,68 @@ Two reasons INT8 isn't the answer here, both worth stating:
 
 **Conclusion: FP16 (1.76×) is the per-block sweet spot** on the standard TensorRT paths.
 
-## Methodology
+## Methodology (Stages 1–3, per-block)
 - **Input capture:** a forward pre-hook grabs the block's actual `(args, kwargs)` during
   a real `inference_windowed` call, so the exported module sees exactly the tensors it
   runs on — no hand-constructed dummy shapes.
 - **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
-  `execute_async_v3` on a private stream (no pycuda) — the project's depth-engine idiom.
+  `execute_async_v3` on a private stream (no pycuda) — fine here because the standalone
+  block has its inputs pre-synced (Stage 4 end-to-end needed the current stream instead).
 - **Timing:** CUDA events, 200 timed runs after 50 warmup; median/mean/p95 reported.
 - **Parity:** onnxruntime reference; fp16/INT8 tolerances noted per stage.
 
+## Stage 4 — end-to-end integration (the per-block win does NOT translate)
+Swapped **all 24** aggregator frame blocks for TRT engines and measured whole-model
+fps vs the bf16 PyTorch baseline (`integrate_e2e.py`, 48-frame windowed run, real TUM
+frames). Every input shape, block count, and output structure is discovered at runtime
+via forward hooks — no hand-coded shapes.
+
+| build | whole-model fps | speedup | reconstruction parity (rel) | non-finite |
+|---|---|---|---|---|
+| bf16 PyTorch (baseline) | 7.69 | 1.00× | — | 0 |
+| **TRT strongly-typed bf16** | **8.31** | **1.08×** | 13.69% | 0 |
+| TRT weakly-typed bf16 | 6.78 | 0.88× | 8.17% | 0 |
+
+After the fixes below, engine **engagement is 100%** (2592–2616 engine calls, 0 torch
+fallbacks). The headline: **the isolated 1.76× per-block fusion win (Stage 2) does not
+survive end-to-end.** The best whole-model result is ~1.08×, and only by accepting
+~14% precision drift; keeping precision faithful (fp32 LayerNorm/softmax, weakly-typed)
+tightens parity to ~8% but goes *net slower* (0.88×). The frame blocks are simply not
+the bottleneck — the stateful `global_blocks` (KV-cache) + DPT/camera heads stay in
+PyTorch and dominate the runtime. The 8–14% parity is not error but TRT-bf16 vs
+PyTorch-autocast-bf16 diverging over 24 non-associative fp accumulations.
+
+### What it took to get a *correct* end-to-end number (the real engineering)
+Each of these was measured, not assumed — the naive swap was wrong in four separate ways:
+1. **Dynamic-batch profiles (11% → 100% engagement).** Frame blocks are called at
+   *variable* batch (≤ 8: scale-frame / window / partial passes). A static engine built
+   for one shape engaged only 11% of calls (89% fell back to torch → the "speedup" was
+   just the baseline). Fix: export a dynamic batch axis + build one `1..max_batch`
+   optimization profile per block (`max_batch` auto-detected from the capture pass).
+2. **Stream-race NaN (precision-independent).** Running the engine on a *private* CUDA
+   stream mid-forward raced the default-stream ops still producing the input → the
+   engine read stale memory → ~40% NaN, byte-identical in fp16 and bf16. Fix: run on
+   torch's **current stream** so the engine is ordered with the surrounding ops.
+3. **fp16 is a red herring here.** Peak frame-block input activation is only **268.7**
+   (fp16 caps at 65504) — measured, so the NaN was never fp16 overflow. bf16 and fp16
+   gave identical NaN, confirming it was structural (the stream race), not numeric.
+4. **Mixed precision must be matched.** The block runs LayerNorm/softmax in **fp32**
+   under `autocast(bf16)`. A strongly-typed all-bf16 engine forces them to bf16 → 13.69%
+   drift; a weakly-typed engine (fp32 ONNX + BF16 builder flag, norms stay fp32) mirrors
+   autocast → 8.17%, but is slower.
+5. **Shared device memory.** 24 weakly-typed (fp32) contexts want ~1.2 GB each →
+   28 GB > the A10G's 22.5 GB. The blocks run sequentially on one stream, so they share
+   **one** device-memory scratch (sized to the largest engine) — 24×1.2 GB → 1×1.2 GB.
+
 ## What's next (not done)
-- **End-to-end integration:** wire the fp16 engine into the aggregator and measure
-  whole-model fps. Expected to be *diluted* vs 1.76× — the frame blocks are only part
-  of the compute, and the stateful `global_blocks` + heads stay in PyTorch.
-- **The hard win:** the KV-cache `global_blocks` (dynamic control flow) — the real
-  remaining latency, and the genuinely difficult export.
+- **The real target: the KV-cache `global_blocks`** (dynamic control flow). Stage 4
+  proves the frame blocks aren't where the time goes; the `global_blocks` + heads are.
+  That's the genuinely difficult export (stateful, data-dependent) and the only path to
+  a meaningful whole-model speedup.
+
+## Methodology (Stage 4, end-to-end)
+- **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
+  `execute_async_v3` on torch's **current stream** (no pycuda) — ordered with the model.
+- **Timing:** whole-model `inference_windowed`, warmup then timed iters, fps = frames/s.
+- **Parity:** baseline vs TRT full reconstruction on identical real frames; NaN-aware
+  (per-side non-finite counts + max abs diff over jointly-finite elements).
