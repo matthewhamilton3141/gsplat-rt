@@ -73,7 +73,13 @@ def make_calibrator(npz_path: str, cache_path: str, trt):
 
 
 def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool, int8, calibrator,
-                 workspace_gb: int, logger, trt) -> bytes:
+                 workspace_gb: int, logger, trt, dynamic_profiles=None) -> bytes:
+    """Build a serialized TensorRT engine from `onnx_path`.
+
+    `dynamic_profiles`, if given, maps input name -> (min_shape, opt_shape, max_shape)
+    and switches the engine to dynamic shapes via one optimization profile (needed
+    when a block is called at several batch sizes — the aggregator's scale-frame vs
+    window passes). Omit it (default) for a fixed-shape engine (Stages 1-3)."""
     builder = trt.Builder(logger)
     flags = 0
     ndcf = trt.NetworkDefinitionCreationFlag
@@ -92,6 +98,12 @@ def build_engine(onnx_path: str, fp16: bool, strongly_typed: bool, int8, calibra
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
+    if dynamic_profiles:
+        profile = builder.create_optimization_profile()
+        for name, (mn, opt, mx) in dynamic_profiles.items():
+            profile.set_shape(name, tuple(mn), tuple(opt), tuple(mx))
+        config.add_optimization_profile(profile)
+        print(f"[trt] dynamic profile: {dynamic_profiles}")
     if int8:
         config.set_flag(trt.BuilderFlag.INT8)
         if fp16 and hasattr(trt.BuilderFlag, "FP16"):

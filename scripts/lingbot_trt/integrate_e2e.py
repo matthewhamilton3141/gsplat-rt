@@ -84,9 +84,12 @@ def _slots_and_tensors(args, kwargs):
 # TRT-backed frame block (drop-in replacement, torch fallback)
 # ---------------------------------------------------------------------------
 
-def _make_trt_block(orig, engine_bytes, slots, in_shapes, out_template, trt, logger):
-    """Build an nn.Module that runs `engine_bytes` for the frame block, falling
-    back to `orig` (the real bf16 block) for any shape the static engine can't take."""
+def _make_trt_block(orig, engine_bytes, slots, in_shapes, max_batch, out_template,
+                    trt, logger):
+    """Build an nn.Module that runs `engine_bytes` (a dynamic-batch fp16 engine) for
+    the frame block. The batch dim (dim 0) is dynamic up to `max_batch`; the trailing
+    dims are fixed. Falls back to `orig` (the real bf16 block) only when a call's
+    trailing dims differ from the captured block or its batch exceeds the profile."""
     import torch
 
     runtime = trt.Runtime(logger)
@@ -102,11 +105,8 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, out_template, trt, log
             in_names.append(name); in_dtypes.append(dt)
         else:
             out_names.append(name); out_dtypes.append(dt)
-    # pre-allocate output buffers (static shapes)
-    out_bufs = [torch.empty(tuple(engine.get_tensor_shape(n)), dtype=d, device="cuda")
-                for n, d in zip(out_names, out_dtypes)]
-    for n, b in zip(out_names, out_bufs):
-        context.set_tensor_address(n, b.data_ptr())
+    # fixed trailing shape per input (everything but the dynamic batch dim 0)
+    in_tails = [tuple(s[1:]) for s in in_shapes]
     out_tmpl_dtypes = [t.dtype for t in _flatten_tensors(out_template)]
 
     class TRTBlock(torch.nn.Module):
@@ -123,19 +123,29 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, out_template, trt, log
             except (IndexError, KeyError):
                 self.n_fallback += 1
                 return self.orig(*args, **kwargs)
-            if any(tuple(t.shape) != shp for t, shp in zip(tin, in_shapes)):
-                self.n_fallback += 1                      # partial window / off-profile
+            # dynamic batch (dim 0) is fine; trailing dims must match and batch must
+            # be within the built profile.
+            if any(tuple(t.shape[1:]) != tail or t.shape[0] > max_batch
+                   for t, tail in zip(tin, in_tails)):
+                self.n_fallback += 1                      # off-profile shape
                 return self.orig(*args, **kwargs)
 
             held = []                                     # keep cast tensors alive
             for name, dt, t in zip(in_names, in_dtypes, tin):
                 x = t.to(dt).contiguous() if t.dtype != dt else t.contiguous()
                 held.append(x)
+                context.set_input_shape(name, tuple(x.shape))
                 context.set_tensor_address(name, x.data_ptr())
+            # output shapes depend on the batch we just set -> allocate now
+            out_bufs = [torch.empty(tuple(context.get_tensor_shape(n)), dtype=d,
+                                    device="cuda")
+                        for n, d in zip(out_names, out_dtypes)]
+            for n, b in zip(out_names, out_bufs):
+                context.set_tensor_address(n, b.data_ptr())
             with torch.cuda.stream(stream):
                 context.execute_async_v3(stream_handle=stream.cuda_stream)
             stream.synchronize()
-            outs = [b.to(td).clone() for b, td in zip(out_bufs, out_tmpl_dtypes)]
+            outs = [b.to(td) for b, td in zip(out_bufs, out_tmpl_dtypes)]
             self.n_trt += 1
             return _rebuild(out_template, iter(outs))
 
@@ -146,14 +156,17 @@ def _make_trt_block(orig, engine_bytes, slots, in_shapes, out_template, trt, log
 # Per-block ONNX export + engine build (fp16, strongly-typed)
 # ---------------------------------------------------------------------------
 
-def _export_and_build(idx, block, slots, tensors, engine_dir, opset, workspace_gb,
-                      logger, trt):
-    """Export block `idx` to a true-fp16 ONNX and build a strongly-typed fp16 engine.
+def _export_and_build(idx, block, slots, tensors, max_batch, engine_dir, opset,
+                      workspace_gb, logger, trt):
+    """Export block `idx` to a true-fp16 ONNX (dynamic batch dim) and build a
+    strongly-typed fp16 engine with a batch-1..max_batch optimization profile.
     Returns engine bytes. Caches both artefacts under engine_dir."""
     import torch
 
-    onnx_path = os.path.join(engine_dir, f"frame_block{idx}.fp16.onnx")
-    eng_path = os.path.join(engine_dir, f"frame_block{idx}.fp16.engine")
+    # ".dyn" so these dynamic-batch artefacts never collide with Stage-4's earlier
+    # static-shape cache (a stale static engine would reject set_input_shape).
+    onnx_path = os.path.join(engine_dir, f"frame_block{idx}.fp16.dyn.onnx")
+    eng_path = os.path.join(engine_dir, f"frame_block{idx}.fp16.dyn.engine")
     if os.path.exists(eng_path):
         with open(eng_path, "rb") as f:
             print(f"[block {idx}] loaded cached engine {eng_path}")
@@ -192,13 +205,21 @@ def _export_and_build(idx, block, slots, tensors, engine_dir, opset, workspace_g
         n_out = len(wrapper(*tin))
     out_names = [f"out{i}" for i in range(n_out)]
 
-    print(f"[block {idx}] exporting fp16 ONNX -> {onnx_path}")
+    # dim 0 (frame count) varies across scale-frame / window / partial calls -> mark
+    # it dynamic on every I/O so one engine covers batch 1..max_batch.
+    dyn_axes = {n: {0: "batch"} for n in in_names + out_names}
+
+    print(f"[block {idx}] exporting fp16 ONNX (dynamic batch) -> {onnx_path}")
     torch.onnx.export(wrapper, tuple(tin), onnx_path, input_names=in_names,
                       output_names=out_names, opset_version=opset,
-                      do_constant_folding=True, dynamo=False)
+                      do_constant_folding=True, dynamo=False, dynamic_axes=dyn_axes)
+    profiles = {n: ((1, *tuple(t.shape[1:])),
+                    (max_batch, *tuple(t.shape[1:])),
+                    (max_batch, *tuple(t.shape[1:])))
+                for n, t in zip(in_names, tin)}
     engine_bytes = build_engine(onnx_path, fp16=True, strongly_typed=True, int8=False,
                                 calibrator=None, workspace_gb=workspace_gb,
-                                logger=logger, trt=trt)
+                                logger=logger, trt=trt, dynamic_profiles=profiles)
     with open(eng_path, "wb") as f:
         f.write(engine_bytes)
     print(f"[block {idx}] engine saved -> {eng_path}")
@@ -206,6 +227,30 @@ def _export_and_build(idx, block, slots, tensors, engine_dir, opset, workspace_g
 
 
 _CAPTURE = {}   # idx -> {"args","kwargs","out"} (module-level so Wrapper closures see it)
+
+
+def _load_frames(tum_dir, n, h, w, device):
+    """Load `n` real RGB frames (sorted) from a TUM `rgb/` dir as (n,3,h,w) in [0,1].
+    Real images matter for parity: garbage/random input makes the DPT + camera heads
+    emit NaN/Inf, so the baseline itself goes NaN and the compare is meaningless.
+    Falls back to random noise (with a warning) if the dir is unusable."""
+    import torch
+    import glob
+    files = sorted(glob.glob(os.path.join(tum_dir, "*.png")) +
+                   glob.glob(os.path.join(tum_dir, "*.jpg")))
+    if not files:
+        print(f"WARNING: no frames in {tum_dir} — falling back to random input "
+              f"(parity may be NaN). Pass --tum-dir to a TUM rgb/ folder.")
+        torch.manual_seed(0)
+        return torch.rand(n, 3, h, w, device=device)
+    from PIL import Image
+    files = (files * ((n // len(files)) + 1))[:n]         # tile if the clip is short
+    arrs = []
+    for f in files:
+        img = Image.open(f).convert("RGB").resize((w, h))
+        arrs.append(torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0))
+    print(f"loaded {n} real frames from {tum_dir}")
+    return torch.stack(arrs).permute(0, 3, 1, 2).contiguous().to(device)
 
 
 def _time_inference(model, imgs, args, warmup, iters):
@@ -245,8 +290,13 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=392)
     ap.add_argument("--width", type=int, default=518)
     ap.add_argument("--frames", type=int, default=48,
-                    help="frames in the timed clip (random imgs; content is irrelevant "
-                         "to fps and parity compares the two runs on identical input)")
+                    help="frames in the timed clip (loaded from --tum-dir; parity "
+                         "compares the baseline and TRT runs on this identical input)")
+    ap.add_argument("--tum-dir",
+                    default=os.path.expanduser(
+                        "~/gsplat-rt/data/tum/rgbd_dataset_freiburg1_desk/rgb"),
+                    help="real RGB frames for the timed/parity run (real input keeps "
+                         "the heads from emitting NaN; falls back to random if missing)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--opset", type=int, default=18)
@@ -279,16 +329,21 @@ def main() -> int:
     print(f"aggregator has {n_blocks} frame blocks")
 
     # --- capture real inputs + output structure for every frame block ----------
-    torch.manual_seed(0)
-    imgs = torch.rand(args.frames, 3, args.height, args.width, device=device)
+    imgs = _load_frames(args.tum_dir, args.frames, args.height, args.width, device)
 
     handles = []
     for i, blk in enumerate(frame_blocks):
         def mk(idx):
             def pre(mod, a, kw):
+                import torch as _t
                 _CAPTURE.setdefault(idx, {})
                 if "args" not in _CAPTURE[idx]:
                     _CAPTURE[idx]["args"], _CAPTURE[idx]["kwargs"] = a, kw
+                # track the largest batch (dim 0) this block is ever called with, so
+                # the dynamic profile's max covers scale-frame / window / partial calls.
+                b = max((v.shape[0] for v in list(a) + list(kw.values())
+                         if _t.is_tensor(v)), default=0)
+                _CAPTURE[idx]["max_batch"] = max(_CAPTURE[idx].get("max_batch", 0), b)
 
             def post(mod, a, kw, out):
                 _CAPTURE.setdefault(idx, {})
@@ -314,7 +369,9 @@ def main() -> int:
         return 2
     shp0 = [tuple(t.shape) for t in _slots_and_tensors(_CAPTURE[0]["args"],
                                                        _CAPTURE[0]["kwargs"])[1]]
-    print(f"block-0 tensor input shapes: {shp0}")
+    max_batch = max(_CAPTURE[i]["max_batch"] for i in range(n_blocks))
+    print(f"block-0 tensor input shapes: {shp0}  (max batch seen across blocks: "
+          f"{max_batch})")
 
     # --- baseline (all-torch bf16) ---------------------------------------------
     print("\n== baseline (bf16 PyTorch) ==")
@@ -327,9 +384,10 @@ def main() -> int:
     for i in range(n_swap):
         slots, tensors = _slots_and_tensors(_CAPTURE[i]["args"], _CAPTURE[i]["kwargs"])
         in_shapes = [tuple(t.shape) for t in tensors]
-        eng = _export_and_build(i, frame_blocks[i], slots, tensors, args.engine_dir,
-                                args.opset, args.workspace_gb, logger, trt)
-        tb = _make_trt_block(frame_blocks[i], eng, slots, in_shapes,
+        eng = _export_and_build(i, frame_blocks[i], slots, tensors, max_batch,
+                                args.engine_dir, args.opset, args.workspace_gb,
+                                logger, trt)
+        tb = _make_trt_block(frame_blocks[i], eng, slots, in_shapes, max_batch,
                              _CAPTURE[i]["out"], trt, logger)
         frame_blocks[i] = tb
         trt_blocks.append(tb)
