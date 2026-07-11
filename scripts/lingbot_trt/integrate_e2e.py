@@ -425,6 +425,10 @@ def main() -> int:
                              _CAPTURE[i]["out"], trt, logger)
         frame_blocks[i] = tb
         trt_blocks.append(tb)
+        # release the per-block export deepcopy + fragmentation so the next build's
+        # autotuner has room (weakly-typed builds probe fp32 + bf16 tactics and OOM
+        # otherwise, with the 4.4 GB model + prior engine contexts resident).
+        torch.cuda.empty_cache()
     print(f"\nswapped {n_swap}/{n_blocks} frame blocks -> TRT {args.precision}")
 
     # --- per-block self-check: engine vs orig on the block's OWN captured input --
