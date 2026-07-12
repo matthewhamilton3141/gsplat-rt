@@ -8,9 +8,9 @@ gsplat-rt turns a live RGB stream into a 3D scene a robot can both *see* and *to
 
 *Real pipeline output — a monocular RGB stream (TUM fr1/desk) reconstructed into 3D Gaussian splats, with real source intrinsics + cross-frame metric scale.*
 
-[![Orbiting turntable of the TUM desk reconstruction — click to play](docs/reconstruction_turntable_poster.png)](https://github.com/matthewhamilton3141/gsplat-rt/raw/main/docs/reconstruction_turntable.mp4)
+![Orbiting turntable of the TUM desk reconstruction](docs/reconstruction_turntable.gif)
 
-*▶ Click for an orbiting turntable of the same reconstruction (`scripts/render_turntable.py` — a GPU-free numpy point-splat renderer).*
+*Orbiting turntable of the same reconstruction (`scripts/render_turntable.py` — a GPU-free numpy point-splat renderer). [Full-quality MP4 →](docs/reconstruction_turntable.mp4)*
 
 ## Headline results *(measured, NVIDIA A10G)*
 
