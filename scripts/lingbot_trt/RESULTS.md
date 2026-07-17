@@ -252,17 +252,37 @@ picks per-layer precision, keeps precision-sensitive ops fp32).
 reasons: the head runs **fp32** in production (so fp16 is a genuine precision+fusion win, not
 the equal-precision fusion the bf16 blocks got), it's **static** (no dynamic cache-length engine
 penalty that diluted the blocks), and it's **conv/GEMM-heavy** (ideal for fp16 tensor cores).
-Projected whole-model from the head alone: `1/(0.825 + 0.175/2.93) ≈` **1.13×**, and unlike the
-blocks this should translate cleanly (no cache/Python per-call overhead) — but that is a
-*projection*; end-to-end integration + parity is not yet measured. ⚠ ORT parity was skipped this
-run (huge inputs → slow on CPU); weakly-typed keeps norms fp32 so drift should mirror Stage-4's
-~8%, but it is **unverified** — verify before trusting the engine in the pipeline.
+Projected whole-model from the head alone: `1/(0.825 + 0.175/2.93) ≈` **1.13×**.
+
+## Stage 6b — DPT head integrated end-to-end (measured): it translated
+`integrate_head_e2e.py` swaps the engine into the live model and measures whole-model fps +
+parity — including a **per-head self-check on the real captured input** (the verification
+Stage 6 skipped). Two findings, both measured:
+
+- **Parity VERIFIED.** TRT fp16 engine vs the torch fp32 head on the real input: **1.19% worst
+  rel diff, 0 non-finite** (much tighter than the ~8% guess — the DPT head is conv/interp-heavy,
+  which fp16 handles cleanly). Resolves the Stage-6 caveat.
+- **Dynamic frame axis was required** (Stage-4 lesson, again). The head is called at variable
+  frame counts (S = 1..8: chunks / scale pass / partial windows), so a *static* engine covered
+  only **13/109 calls** (88% torch fallback) → 1.035×. Marking dim-1 dynamic + one optimization
+  profile lifted engagement to **109/109 (0 fallbacks)**.
+
+| build | whole-model fps | speedup | parity | non-finite |
+|---|---|---|---|---|
+| bf16+fp32-head baseline | 7.70 | 1.00× | — | 0 |
+| static head engine (12% engaged) | 7.97 | 1.035× | 1.15% | 0 |
+| **dynamic head engine (100% engaged)** | **8.45** | **1.098×** | 1.75% | 0 |
+
+**1.098× — and notably the heads (17.5% of runtime) beat the global_blocks (45% → 1.069×)
+end-to-end.** A smaller runtime slice won more whole-model because it *translates*: static (no
+dynamic-cache/Python overhead that diluted the blocks) + a bigger per-component speedup (2.93×
+vs 1.53×). The "static heads are the cleaner win per effort" call (Stage 3) held up, measured.
 
 ## What's next (not done)
-- **Integrate the DPT head** end-to-end + parity (should translate near the isolated 2.93×,
-  being static) — the best remaining whole-model lever; then combine with the global blocks.
-- **Global-block gap** (1.069×→1.19×): static per-cache-length engines / CUDA-graph. Diminishing
-  returns — likely near the practical ceiling for that path.
+- **Stack heads + global_blocks** in one run (independent chunks) for the combined whole-model
+  number — the two biggest levers together (projected ~1.16–1.20×, to be measured).
+- **Global-block gap** (1.069×): static per-cache-length engines / CUDA-graph. Diminishing
+  returns — likely near the practical ceiling for that path; leave it.
 
 ## Methodology (Stage 4, end-to-end)
 - **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
