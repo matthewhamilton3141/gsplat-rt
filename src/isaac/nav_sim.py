@@ -186,6 +186,21 @@ class DiffDriveNavEnv:
                 return True
         return False
 
+    def _clearance(self, xy: np.ndarray) -> float:
+        """Signed distance (m) from the robot disc edge to the nearest obstacle/wall edge.
+
+        Positive is free space ahead of contact, 0 at touch (negative only under overlap,
+        which `_collides` already flags). Feeds the optional dense proximity-penalty reward
+        shaping; mirrors `_collides`' geometry (bounds + circular obstacles).
+        """
+        r = self.cfg.robot_radius
+        x_min, y_min, x_max, y_max = self.cfg.bounds
+        clear = min(xy[0] - x_min, x_max - xy[0], xy[1] - y_min, y_max - xy[1]) - r
+        if len(self._obstacles):
+            d = np.linalg.norm(self._obstacles[:, :2] - xy[None, :], axis=1)
+            clear = min(clear, float(np.min(d - self._obstacles[:, 2])) - r)
+        return float(clear)
+
     def _lidar(self) -> np.ndarray:
         """Normalised free-distance readings for the beam fan (empty if disabled)."""
         n = self.cfg.n_lidar_beams
@@ -309,7 +324,9 @@ class DiffDriveNavEnv:
         self._step += 1
         curr_dist = distance_to_goal(self.robot_xy, self._goal)
         reached = reached_goal(self.robot_xy, self._goal, self.cfg.task)
-        r = nav_reward(self._prev_dist, curr_dist, collided, reached, self.cfg.task)
+        clearance = self._clearance(self.robot_xy)
+        r = nav_reward(self._prev_dist, curr_dist, collided, reached, self.cfg.task,
+                       clearance=clearance)
         self._prev_dist = curr_dist
 
         term = nav_terminated(reached, collided)

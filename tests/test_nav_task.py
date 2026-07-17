@@ -17,8 +17,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from isaac.nav_task import (  # noqa: E402
     NavTaskConfig, OBS_DIM, OBS_DIST, OBS_GOAL_X, OBS_GOAL_Y,
-    distance_to_goal, goal_in_robot_frame, observation, reached_goal,
-    reward, terminated, truncated,
+    clearance_penalty, distance_to_goal, goal_in_robot_frame, observation,
+    reached_goal, reward, terminated, truncated,
 )
 
 
@@ -66,6 +66,36 @@ def test_reward_collision_and_success_terms():
     assert abs(base) < 1e-9
     assert reward(2.0, 2.0, collided=True, reached=False, cfg=cfg) == -5.0
     assert reward(2.0, 2.0, collided=False, reached=True, cfg=cfg) == 10.0
+
+
+def test_clearance_penalty_off_by_default():
+    # Default config has clearance_penalty=0 -> the dense proximity term is inert, and the
+    # default `clearance=inf` means existing callers behave exactly as before.
+    cfg = NavTaskConfig(time_penalty=0.0)
+    assert clearance_penalty(0.0, cfg) == 0.0            # even at contact, off
+    assert clearance_penalty(0.05, cfg) == 0.0
+    # reward with/without a clearance arg is identical when the feature is off
+    assert reward(2.0, 2.0, False, False, cfg) == reward(2.0, 2.0, False, False, cfg,
+                                                         clearance=0.0)
+
+
+def test_clearance_penalty_ramps_linearly_to_contact():
+    cfg = NavTaskConfig(clearance_margin=0.4, clearance_penalty=2.0)
+    assert clearance_penalty(0.4, cfg) == 0.0            # exactly at the margin -> no penalty
+    assert clearance_penalty(1.0, cfg) == 0.0           # beyond the margin -> no penalty
+    assert abs(clearance_penalty(0.2, cfg) - 1.0) < 1e-9  # halfway in -> half the peak
+    assert abs(clearance_penalty(0.0, cfg) - 2.0) < 1e-9  # contact -> full peak
+    assert abs(clearance_penalty(-0.3, cfg) - 2.0) < 1e-9  # deeper overlap clamps at peak
+
+
+def test_clearance_penalty_subtracts_from_reward():
+    # A robot that makes zero progress but sits inside the margin is penalised for proximity.
+    cfg = NavTaskConfig(time_penalty=0.0, clearance_margin=0.4, clearance_penalty=2.0)
+    r_clear = reward(2.0, 2.0, False, False, cfg, clearance=1.0)   # well clear
+    r_near = reward(2.0, 2.0, False, False, cfg, clearance=0.1)    # close to an obstacle
+    assert abs(r_clear) < 1e-9
+    assert r_near < r_clear
+    assert abs(r_near - (-clearance_penalty(0.1, cfg))) < 1e-9
 
 
 def test_termination_vs_truncation():

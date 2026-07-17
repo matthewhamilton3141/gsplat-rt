@@ -28,8 +28,25 @@ def make_cfg(args) -> NavSimConfig:
         n_lidar_beams=args.beams,
         occupancy_size=args.occupancy,
         randomize_obstacles=args.obstacles,
-        task=NavTaskConfig(max_steps=args.max_steps),
+        task=NavTaskConfig(
+            max_steps=args.max_steps,
+            collision_penalty=args.collision_penalty,
+            clearance_margin=args.clearance_margin,
+            clearance_penalty=args.clearance_penalty,
+        ),
     )
+
+
+def make_ppo(venv, seed, device):
+    """Construct the PPO learner with the milestone's tuned hyperparameters.
+
+    Factored out so the reward-shaping sweep (`sweep_reward.py`) trains every candidate
+    with byte-identical settings — the only thing that varies across the sweep is the
+    reward config, so the collision comparison is apples-to-apples.
+    """
+    from stable_baselines3 import PPO
+    return PPO("MlpPolicy", venv, verbose=0, seed=seed, device=device,
+               n_steps=1024, batch_size=1024, gae_lambda=0.95, gamma=0.99, ent_coef=0.005)
 
 
 def _rollout(env_ctor, policy, n, max_steps, seed0):
@@ -59,13 +76,18 @@ def main() -> int:
     ap.add_argument("--occupancy", type=int, default=0, help="egocentric grid size (0=off)")
     ap.add_argument("--obstacles", type=int, default=5, help="random obstacles per episode")
     ap.add_argument("--max-steps", type=int, default=500)
+    ap.add_argument("--collision-penalty", type=float, default=5.0,
+                    help="one-off penalty on contact (raise to discourage collisions)")
+    ap.add_argument("--clearance-margin", type=float, default=0.30,
+                    help="clearance (m) at/below which the dense proximity penalty ramps in")
+    ap.add_argument("--clearance-penalty", type=float, default=0.0,
+                    help="peak dense proximity penalty at contact (0 = off, the old reward)")
     ap.add_argument("--eval-episodes", type=int, default=200)
     ap.add_argument("--out", default="/tmp/nav_ppo")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     import torch
-    from stable_baselines3 import PPO
     from stable_baselines3.common.env_util import make_vec_env
     from isaac.nav_gym import NavGymEnv
 
@@ -75,8 +97,7 @@ def main() -> int:
           f"{args.obstacles} random obstacles/episode")
 
     venv = make_vec_env(lambda: NavGymEnv(make_cfg(args)), n_envs=args.n_envs, seed=args.seed)
-    model = PPO("MlpPolicy", venv, verbose=1, seed=args.seed, device=device,
-                n_steps=1024, batch_size=1024, gae_lambda=0.95, gamma=0.99, ent_coef=0.005)
+    model = make_ppo(venv, args.seed, device)
     model.learn(total_timesteps=args.timesteps, progress_bar=False)
     os.makedirs(args.out, exist_ok=True)
     save_path = os.path.join(args.out, "ppo_nav")
