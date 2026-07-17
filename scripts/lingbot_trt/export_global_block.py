@@ -128,6 +128,9 @@ def main() -> int:
     ap.add_argument("--dynamic-cache", action="store_true",
                     help="mark the cache history dim (dim 2) dynamic; default static so "
                          "build_and_bench_trt.py's fixed-shape path benches it directly")
+    ap.add_argument("--bench-torch", type=int, default=0, metavar="ITERS",
+                    help="time the original torch block (bf16 autocast, complex RoPE) on the "
+                         "captured inputs = the production baseline the TRT engine replaces")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.abspath(args.lingbot_root))
@@ -246,6 +249,10 @@ def main() -> int:
         print(f"\ndumped captured I/O -> {args.dump_io} ({len(dump)} arrays)")
 
     print("\nPHASE 1 complete. If PHASE 2 fails, the above is what we need to finish the export.")
+
+    if args.bench_torch:
+        _bench_torch_block(block, cap, args.bench_torch, np, torch)
+
     if args.no_export:
         return 0
 
@@ -277,6 +284,49 @@ def _iter_call(cap, torch):
 
 def _slot_name(i, k):
     return f"arg{k}" if isinstance(k, int) else str(k)
+
+
+def _bench_torch_block(block, cap, iters, np, torch):
+    """Time the ORIGINAL torch block (complex RoPE, bf16 autocast) on the captured inputs.
+
+    This is the production baseline the TRT engine replaces — same block, same shapes, same
+    dtype path as the live windowed inference. Uses `_skip_append` so the cache doesn't grow
+    across iterations (compute is equivalent to the keyframe path minus the store/evict).
+    """
+    device = next(block.parameters()).device
+    x = cap["args"][0]
+    base_kw = dict(cap["kwargs"])
+    cb = cap["cache_before"]
+
+    def make_kv():
+        kv = {name: t.to(device) for name, (_, _, t) in cb.items()}
+        kv["_skip_append"] = True
+        return kv
+
+    def call():
+        kw = dict(base_kw)
+        kw["kv_cache"] = make_kv()          # built OUTSIDE the timed region below
+        return kw
+
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        for _ in range(max(10, iters // 4)):
+            block(x, **call())
+        torch.cuda.synchronize()
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        ts = []
+        for _ in range(iters):
+            kw = call()                      # cache build excluded from timing
+            torch.cuda.synchronize()
+            s.record()
+            block(x, **kw)
+            e.record()
+            torch.cuda.synchronize()
+            ts.append(s.elapsed_time(e))
+    ts = np.array(ts)
+    print(f"\n[torch] block fwd (bf16 autocast, complex RoPE) over {iters} runs: "
+          f"median {np.median(ts):.3f} ms | mean {ts.mean():.3f} ms | "
+          f"p95 {np.percentile(ts, 95):.3f} ms")
 
 
 def _report_parity(label, a, b, np):
