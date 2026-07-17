@@ -204,16 +204,44 @@ Measured, one block (index 0, first-decode call: 1042 tokens, 8→9 frame cache,
   per-block gain; the real strongly-typed gain is 1.53×, so ~1.19× is the honest whole-model
   number to carry (the earlier 1.09× was the weakly-typed engine before this lever).
 
+## Stage 5, Step 3 — end-to-end integration (measured: the per-block win still dilutes)
+`integrate_global_e2e.py` swaps **all 24** `global_blocks` for the strongly-typed fp16
+engines and measures whole-model fps vs the bf16 baseline (48-frame TUM clip, real frames,
+same NaN-aware parity harness as Stage 4). Each block is a functional engine
+`f(x, pos_real, k_in, v_in) → (out, k_out, v_out)` with a **dynamic cache-length profile**;
+the KV cache is managed in Python (concat happens in-graph, returned + written back), complex
+`pos` is converted to real cos/sin per call, and the **prefill / scale-frame call is left in
+PyTorch** (torch fallback). Regime: the observed cache stays at **8..15 frames** (≪ the
+~72-frame eviction threshold), so the baked no-eviction engine is valid; the run asserts this.
+
+| build | whole-model fps | speedup | reconstruction parity | non-finite |
+|---|---|---|---|---|
+| bf16 PyTorch (baseline) | 7.69 | 1.00× | — | 0 |
+| global_blocks → TRT fp16 (cache round-trip) | 7.81 | 1.015× | 3.6% rel | 0 |
+| **global_blocks → TRT fp16 (fp16 cache)** | **8.22** | **1.069×** | 3.5% rel | 0 |
+
+2328 engine calls / 288 torch fallbacks (the prefill calls); 0 non-finite either side.
+Dropping a growing-cache fp32↔fp16 round-trip (store the engine's fp16 in place, restore
+torch dtype only on the rare fallback) lifted 1.015× → **1.069×** with parity unchanged.
+
+**The honest headline: the isolated 1.53× per-block collapses to 1.069× whole-model** — a
+*real* measured win (~7% faster, tight parity, zero NaN), but far below both the per-block
+figure and the **1.19× Amdahl projection** from Step 2. **Correcting my own projection down:
+1.19× projected → 1.069× measured.** Why the gap: (a) the integrated engines are
+**dynamic** cache-length (variable-KV attention → slower tactics than the 1.80 ms *static*
+bench); (b) per-call Python overhead — shape re-specialization, output-cache alloc, the
+complex→real `pos` conversion, dict bookkeeping. This is the **Stage-4 lesson a third time**:
+even the *dominant* 45% component, with a genuine 1.53× isolated kernel, nets ~7% end-to-end
+once integration overhead and Amdahl are paid. Measured, not assumed.
+
 ## What's next (not done)
-- **Per-block lever done (1.21× → 1.53× via strongly-typed fp16).** Remaining upside: INT8
-  (calibration npz already dumped by the exporter → `--calib-npz`, though the block is
-  attention/softmax-bound so expect ≤10–20%); the KV-cache-engine idea.
-- **Integrate all 24 blocks** (`integrate_e2e.py` pattern) + whole-model fps vs the bf16
-  baseline with the NaN-aware parity harness — only worth it once the per-block gain and
-  the dynamic-cache-length engine (currently static at 9 frames) are settled.
-- **Caveat to carry:** the static engine bakes the cache conditionals for one length
-  (two `TracerWarning`s on the skip-append branch); a streaming engine needs the
-  `--dynamic-cache` axis + an optimization profile over cache history.
+- **Close the projection↔measured gap** (if pursued): static per-cache-length engines instead
+  of one dynamic engine (8..15 frames = a handful of engines/block — kills the dynamic-shape
+  penalty but multiplies build/memory); a CUDA-graph or fused wrapper to erase per-call Python
+  overhead; INT8 (≤10–20%, softmax-bound). Diminishing returns — 1.069× is likely near the
+  practical ceiling for this path.
+- **The pragmatic read:** the heads (DPT + camera, 17.5%) are static and far easier to export;
+  after global_blocks, they're the next-largest untouched chunk and a cleaner win per effort.
 
 ## Methodology (Stage 4, end-to-end)
 - **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
