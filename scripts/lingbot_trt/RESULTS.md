@@ -234,14 +234,35 @@ complex→real `pos` conversion, dict bookkeeping. This is the **Stage-4 lesson 
 even the *dominant* 45% component, with a genuine 1.53× isolated kernel, nets ~7% end-to-end
 once integration overhead and Amdahl are paid. Measured, not assumed.
 
+## Stage 6 — DPT depth head → TRT (isolated, measured): the static win the blocks weren't
+Following the Stage-3 read ("the heads are static → the cleaner win per effort"), exported the
+`DPTHead` (the heavy one; the camera head outputs `(1,1,9)` and is negligible). It's a static
+feed-forward module taking 4 aggregated-token feature maps `(1,8,1042,2048)` + `images`
+`(1,8,3,392,518)` → `(depth, conf)` `(1,8,392,518,*)`. `export_head.py` captures the real call
+and exports; the true-fp16 export tripped an internal fp32↔fp16 mismatch (common in a complex
+head), so — the Stage-4 recipe — export fp32 ONNX + build a **weakly-typed fp16** engine (TRT
+picks per-layer precision, keeps precision-sensitive ops fp32).
+
+| build | latency / call (median, 200) | speedup |
+|---|---|---|
+| **torch fp32 (production baseline)** | **109.9 ms** | 1.00× |
+| **TRT weakly-typed fp16** | **37.5 ms** | **2.93×** |
+
+**2.93× — nearly double the global-block per-component win (1.53×)**, and for structural
+reasons: the head runs **fp32** in production (so fp16 is a genuine precision+fusion win, not
+the equal-precision fusion the bf16 blocks got), it's **static** (no dynamic cache-length engine
+penalty that diluted the blocks), and it's **conv/GEMM-heavy** (ideal for fp16 tensor cores).
+Projected whole-model from the head alone: `1/(0.825 + 0.175/2.93) ≈` **1.13×**, and unlike the
+blocks this should translate cleanly (no cache/Python per-call overhead) — but that is a
+*projection*; end-to-end integration + parity is not yet measured. ⚠ ORT parity was skipped this
+run (huge inputs → slow on CPU); weakly-typed keeps norms fp32 so drift should mirror Stage-4's
+~8%, but it is **unverified** — verify before trusting the engine in the pipeline.
+
 ## What's next (not done)
-- **Close the projection↔measured gap** (if pursued): static per-cache-length engines instead
-  of one dynamic engine (8..15 frames = a handful of engines/block — kills the dynamic-shape
-  penalty but multiplies build/memory); a CUDA-graph or fused wrapper to erase per-call Python
-  overhead; INT8 (≤10–20%, softmax-bound). Diminishing returns — 1.069× is likely near the
-  practical ceiling for this path.
-- **The pragmatic read:** the heads (DPT + camera, 17.5%) are static and far easier to export;
-  after global_blocks, they're the next-largest untouched chunk and a cleaner win per effort.
+- **Integrate the DPT head** end-to-end + parity (should translate near the isolated 2.93×,
+  being static) — the best remaining whole-model lever; then combine with the global blocks.
+- **Global-block gap** (1.069×→1.19×): static per-cache-length engines / CUDA-graph. Diminishing
+  returns — likely near the practical ceiling for that path.
 
 ## Methodology (Stage 4, end-to-end)
 - **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
