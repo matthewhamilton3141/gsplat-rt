@@ -278,9 +278,34 @@ end-to-end.** A smaller runtime slice won more whole-model because it *translate
 dynamic-cache/Python overhead that diluted the blocks) + a bigger per-component speedup (2.93×
 vs 1.53×). The "static heads are the cleaner win per effort" call (Stage 3) held up, measured.
 
+## Stage 7 — combined `global_blocks` + DPT head (measured: the two levers compound)
+`integrate_combined_e2e.py` swaps **both** biggest levers in ONE windowed run — all 24
+`global_blocks` (stateful, dynamic cache-length fp16 engines) **and** the DPT head (static,
+dynamic frame-axis weakly-typed fp16 engine) — and measures the combined whole-model fps. A
+single capture pass hooks both simultaneously (24 global blocks captured, cache 8..15, head
+S 1..8); same NaN-aware parity harness. 48-frame TUM clip, real frames, A10G.
+
+| build | whole-model fps | speedup | reconstruction parity | non-finite |
+|---|---|---|---|---|
+| bf16+fp32-head baseline | 7.69 | 1.00× | — | 0 |
+| global_blocks → TRT fp16 (alone) | 8.22 | 1.069× | 3.5% rel | 0 |
+| DPT head → TRT fp16 (alone) | 8.45 | 1.098× | 1.75% rel | 0 |
+| **global_blocks + DPT head → TRT (both)** | **9.13** | **1.187×** | 3.23% rel | 0 |
+
+Engagement: 2304 global engine calls / 288 torch fallbacks (the prefill/scale calls) + 108/108
+head calls (0 fallbacks); 0 non-finite either side.
+
+**The honest headline: the two independent levers compound cleanly — 1.187× combined, higher
+than either alone (1.069× / 1.098×) and right at the top of the ~1.16–1.20× projection.** Unlike
+the per-block→whole-model *dilution* that dominated Stages 4–6, this is the opposite lesson,
+also measured: because `global_blocks` (45.2%) and the head (17.5%) are **disjoint runtime
+slices**, moving both to TRT adds their savings rather than fighting for the same time. 62.7% of
+the runtime now runs in TensorRT. Parity is set by the global blocks' bf16-accumulation drift
+(3.23% rel, same regime as their solo 3.5%); the head stays clean. This is the capstone of the
+study: a defensible **1.19× measured whole-model speedup** on a VGGT-class streaming recon model,
+every stage reproduced on the box, zero NaN.
+
 ## What's next (not done)
-- **Stack heads + global_blocks** in one run (independent chunks) for the combined whole-model
-  number — the two biggest levers together (projected ~1.16–1.20×, to be measured).
 - **Global-block gap** (1.069×): static per-cache-length engines / CUDA-graph. Diminishing
   returns — likely near the practical ceiling for that path; leave it.
 
