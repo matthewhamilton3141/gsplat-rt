@@ -23,7 +23,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
-from isaac.nav_sim import DiffDriveNavEnv, NavSimConfig, heuristic_action  # noqa: E402
+from isaac.nav_sim import (  # noqa: E402
+    DiffDriveNavEnv, NavSimConfig, avoidance_action, heuristic_action,
+)
 from isaac.nav_task import ACT_DIM, NavTaskConfig  # noqa: E402
 
 # Match src/mapping/visualization.py so this reads like the pipeline's occupancy PNGs (BGR).
@@ -35,11 +37,14 @@ _OUTCOME_BGR = {"reached": (60, 180, 60), "collided": (40, 40, 220), "timeout": 
 
 def default_scene(n_lidar_beams: int = 0) -> NavSimConfig:
     """A small room with three circular obstacles between a fixed start and goal."""
-    obstacles = np.array([[-1.0, 0.5, 0.6],
-                          [1.2, -0.8, 0.7],
-                          [0.2, 1.6, 0.5]])
+    # The first obstacle sits squarely on the start→goal diagonal, so blind go-to-goal drives
+    # into it while the lidar gap-follower detours around it to the goal — makes the controller
+    # difference visible (blind collides ~step 34; avoidance reaches ~step 110).
+    obstacles = np.array([[0.3, 0.3, 0.6],
+                          [-1.4, 1.4, 0.4],
+                          [1.4, -1.4, 0.4]])
     return NavSimConfig(
-        task=NavTaskConfig(max_steps=400, goal_radius=0.3),
+        task=NavTaskConfig(max_steps=600, goal_radius=0.3),
         bounds=(-3.0, -3.0, 3.0, 3.0),
         obstacles=obstacles,
         fixed_start=(-2.5, -2.5, 0.0),
@@ -53,6 +58,8 @@ def pick_action(controller: str, obs: np.ndarray, cfg: NavSimConfig,
     if controller == "random":
         return np.array([rng.uniform(0.0, cfg.max_lin_vel),
                          rng.uniform(-cfg.max_ang_vel, cfg.max_ang_vel)], np.float32)
+    if controller == "avoidance":
+        return avoidance_action(obs, cfg)
     return heuristic_action(obs, cfg)
 
 
@@ -113,15 +120,22 @@ def render(trajectories, outcomes, cfg: NavSimConfig, path: str,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--controller", choices=["heuristic", "random", "both"], default="heuristic")
+    ap.add_argument("--controller",
+                    choices=["heuristic", "avoidance", "random", "all"], default="avoidance")
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--beams", type=int, default=0, help="lidar beams (obs only; viz unaffected)")
+    ap.add_argument("--beams", type=int, default=0,
+                    help="lidar beams (obs only; auto-set to 15 for the avoidance controller)")
     ap.add_argument("--out", default="nav_rollout.png")
     args = ap.parse_args()
 
-    controllers = ["heuristic", "random"] if args.controller == "both" else [args.controller]
-    cfg = default_scene(n_lidar_beams=args.beams)
+    controllers = (["heuristic", "avoidance", "random"] if args.controller == "all"
+                   else [args.controller])
+    # The gap-follower needs the lidar fan; default it on so the demo is meaningful out of the box.
+    beams = args.beams
+    if beams == 0 and "avoidance" in controllers:
+        beams = 15
+    cfg = default_scene(n_lidar_beams=beams)
     env = DiffDriveNavEnv(cfg)
     rng = np.random.default_rng(args.seed)
 

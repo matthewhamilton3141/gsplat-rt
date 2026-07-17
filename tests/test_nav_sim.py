@@ -16,7 +16,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from isaac.nav_sim import (  # noqa: E402
-    DiffDriveNavEnv, NavSimConfig, heuristic_action,
+    DiffDriveNavEnv, NavSimConfig, avoidance_action, heuristic_action,
+    random_obstacle_field,
 )
 from isaac.nav_task import (  # noqa: E402
     ACT_DIM, OBS_DIM, NavTaskConfig, reward as nav_reward,
@@ -147,6 +148,115 @@ def test_action_clipping_respects_limits():
     env.reset(seed=0)
     env.step([10.0, 10.0])              # way over the limits
     assert env._lin_vel == 0.5 and env._ang_vel == 1.0
+
+
+def test_avoidance_falls_back_to_heuristic_without_lidar():
+    # No lidar -> the gap-follower has nothing to sense, must equal the go-to-goal controller.
+    cfg = _open_field(n_lidar_beams=0)
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    assert np.allclose(avoidance_action(obs, cfg), heuristic_action(obs, cfg))
+
+
+def test_avoidance_does_not_ram_head_on_obstacle():
+    # Same head-on obstacle the naive heuristic crashes into: the gap-follower must steer clear.
+    cfg = _open_field(n_lidar_beams=9, lidar_fov=np.pi, lidar_range=5.0,
+                      obstacles=np.array([[1.0, 0.0, 0.4]]))
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    for _ in range(200):
+        obs, r, term, trunc, info = env.step(avoidance_action(obs, cfg))
+        if term and info["collided"]:
+            raise AssertionError("gap-follower drove into an obstacle it could see")
+        if term and info["reached"]:
+            break
+    assert not info["collided"]
+
+
+def test_avoidance_reaches_goal_around_obstacle():
+    # Obstacle squarely on the straight-line path; the gap-follower should detour and arrive.
+    cfg = NavSimConfig(
+        fixed_start=(0.0, 0.0, 0.0), fixed_goal=(4.0, 0.0),
+        bounds=(-6.0, -6.0, 6.0, 6.0), n_lidar_beams=11, lidar_fov=np.pi, lidar_range=5.0,
+        obstacles=np.array([[2.0, 0.0, 0.5]]), task=NavTaskConfig(max_steps=1000),
+    )
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    reached = False
+    for _ in range(env.cfg.task.max_steps):
+        obs, r, term, trunc, info = env.step(avoidance_action(obs, cfg))
+        assert not info["collided"], "should never collide while following the gap"
+        if term:
+            reached = info["reached"]
+            break
+    assert reached, "gap-follower should route around a single obstacle to the goal"
+
+
+def test_random_obstacle_field_non_overlapping_and_in_bounds():
+    bounds = (-5.0, -5.0, 5.0, 5.0)
+    field = random_obstacle_field(8, bounds, radius_range=(0.3, 0.6), clearance=0.4, seed=1)
+    assert field.ndim == 2 and field.shape[1] == 3 and len(field) <= 8
+    x_min, y_min, x_max, y_max = bounds
+    for cx, cy, r in field:
+        assert x_min <= cx - r and cx + r <= x_max
+        assert y_min <= cy - r and cy + r <= y_max
+    for i in range(len(field)):
+        for j in range(i + 1, len(field)):
+            (xi, yi, ri), (xj, yj, rj) = field[i], field[j]
+            assert np.hypot(xi - xj, yi - yj) > ri + rj, "obstacles must not overlap"
+
+
+def test_random_obstacle_field_keeps_points_clear_and_is_deterministic():
+    bounds = (-5.0, -5.0, 5.0, 5.0)
+    start, goal = (0.0, 0.0), (4.0, 0.0)
+    a = random_obstacle_field(10, bounds, keep_clear=(start, goal), seed=42)
+    b = random_obstacle_field(10, bounds, keep_clear=(start, goal), seed=42)
+    assert np.array_equal(a, b), "same seed must reproduce the field"
+    for cx, cy, r in a:
+        assert np.hypot(cx - start[0], cy - start[1]) > r, "start must stay outside obstacles"
+        assert np.hypot(cx - goal[0], cy - goal[1]) > r, "goal must stay outside obstacles"
+
+
+def test_avoidance_beats_blind_heuristic_on_random_fields():
+    # Over a set of procedurally generated fields, the lidar gap-follower must be a genuine
+    # obstacle-aware baseline: no collisions, and it reaches the goal more often than the
+    # blind go-to-goal controller (which drives straight into obstacles).
+    bounds = (-5.0, -5.0, 5.0, 5.0)
+    start, goal = (-4.0, -4.0, 0.0), (4.0, 4.0)
+
+    def run(policy, seed):
+        field = random_obstacle_field(5, bounds, keep_clear=(start[:2], goal), seed=seed)
+        cfg = NavSimConfig(fixed_start=start, fixed_goal=goal, bounds=bounds, obstacles=field,
+                           n_lidar_beams=15, lidar_fov=np.pi, lidar_range=5.0,
+                           task=NavTaskConfig(max_steps=700))
+        env = DiffDriveNavEnv(cfg)
+        obs, _ = env.reset(seed=seed)
+        for _ in range(700):
+            obs, r, term, trunc, info = env.step(policy(obs, cfg))
+            if term:
+                return bool(info["reached"]), bool(info["collided"])
+        return False, False
+
+    seeds = range(15)
+    avoid = [run(avoidance_action, s) for s in seeds]
+    blind = [run(heuristic_action, s) for s in seeds]
+    avoid_reached = sum(r for r, _ in avoid)
+    avoid_collided = sum(c for _, c in avoid)
+    blind_reached = sum(r for r, _ in blind)
+
+    assert avoid_collided == 0, "gap-follower should not collide on solvable fields"
+    assert avoid_reached > blind_reached, "gap-follower should reach the goal more than blind"
+
+
+def test_random_field_env_is_collision_free_at_reset():
+    # A field generated with the start/goal kept clear must yield a valid (non-colliding) reset.
+    bounds = (-5.0, -5.0, 5.0, 5.0)
+    start, goal = (-4.0, -4.0, 0.0), (4.0, 4.0)
+    field = random_obstacle_field(12, bounds, keep_clear=(start[:2], goal), seed=3)
+    cfg = NavSimConfig(fixed_start=start, fixed_goal=goal, bounds=bounds, obstacles=field)
+    env = DiffDriveNavEnv(cfg)
+    _, info = env.reset(seed=0)
+    assert not env._collides(env.robot_xy) and not info["collided"]
 
 
 if __name__ == "__main__":
