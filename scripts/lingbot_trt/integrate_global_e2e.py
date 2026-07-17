@@ -195,6 +195,8 @@ def _make_trt_global_block(orig, engine_bytes, idx, kmin, kmax, trt, logger, tor
             self.orig = orig
             self.n_trt = 0
             self.n_fallback = 0
+            self.k_dt0 = None                       # torch's native cache dtypes (fp32/bf16),
+            self.v_dt0 = None                       # learned from the first decode call
 
         def forward(self, *args, **kwargs):
             kv = kwargs.get("kv_cache")
@@ -204,12 +206,19 @@ def _make_trt_global_block(orig, engine_bytes, idx, kmin, kmax, trt, logger, tor
             # steady-state decode only; everything else -> the real block.
             if (nf is None or nf > 1 or pos is None or k_cur is None
                     or k_cur.shape[2] < kmin or k_cur.shape[2] > kmax):
+                # Prefill/fallback cats against the cache in torch dtypes. If the engine has
+                # since stored it in fp16, restore the expected dtype for a correct cat.
+                if (self.k_dt0 is not None and isinstance(kv, dict)
+                        and k_cur is not None and k_cur.dtype != self.k_dt0):
+                    kv[kkey] = k_cur.to(self.k_dt0)
+                    kv[vkey] = kv[vkey].to(self.v_dt0)
                 self.n_fallback += 1
                 return self.orig(*args, **kwargs)
 
             x = args[0]
             v_cur = kv[vkey]
-            k_dt, v_dt = k_cur.dtype, v_cur.dtype   # torch keeps k=fp32, v=bf16
+            if self.k_dt0 is None:                  # remember torch's native cache dtypes once
+                self.k_dt0, self.v_dt0 = k_cur.dtype, v_cur.dtype
             # inputs in the exported order: x, pos_real, k_in, v_in
             tin = [x, _real_pos(pos, torch, torch.float32), k_cur, v_cur]
             held = []
@@ -224,11 +233,12 @@ def _make_trt_global_block(orig, engine_bytes, idx, kmin, kmax, trt, logger, tor
                 context.set_tensor_address(n, b.data_ptr())
             stream = torch.cuda.current_stream()
             context.execute_async_v3(stream_handle=stream.cuda_stream)
-            # out_names order = [out, k_out, v_out]; write the grown cache back in the dict's
-            # native dtype so any later torch-fallback (prefill) cat sees the expected type.
+            # out_names order = [out, k_out, v_out]; store the grown cache in the engine's own
+            # fp16 (no round-trip — the engine already computes at fp16, so this loses no
+            # precision beyond what it already did). A later fallback restores the torch dtype.
             res = {n: b for n, b in zip(out_names, out_bufs)}
-            kv[kkey] = res[f"{kkey}_out"].to(k_dt)
-            kv[vkey] = res[f"{vkey}_out"].to(v_dt)
+            kv[kkey] = res[f"{kkey}_out"]
+            kv[vkey] = res[f"{vkey}_out"]
             self.n_trt += 1
             return res["out"].to(x.dtype)
 
