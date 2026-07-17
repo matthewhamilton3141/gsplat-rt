@@ -17,8 +17,10 @@ Design:
     Collision = the robot disc (radius `robot_radius`) touching any obstacle or leaving bounds.
   - Optional lidar: `n_lidar_beams` rays fanned across `lidar_fov` around the heading, each
     returning the normalised free distance to the nearest obstacle/wall (1.0 = clear to
-    `lidar_range`). With beams > 0 the policy observation is `[nav_task obs (7)] + [lidar]`,
-    so the goal contract stays authoritative while obstacle sensing is added cleanly.
+    `lidar_range`). Optional egocentric occupancy grid: `occupancy_size`² robot-centred,
+    heading-aligned cells (1 = occupied/out-of-bounds). The observation is
+    `[nav_task obs (7)] + [lidar] + [occupancy]` (each block present only if enabled), so the
+    goal contract stays authoritative while richer obstacle sensing is added cleanly.
 
 The API is duck-typed to Gymnasium (`reset(seed) -> (obs, info)`,
 `step(action) -> (obs, reward, terminated, truncated, info)`) so wrapping it for
@@ -81,6 +83,15 @@ class NavSimConfig:
     lidar_fov: float = np.pi           # angular span of the fan (rad), centred on heading
     lidar_range: float = 5.0           # max sensed distance (m); readings normalised by this
 
+    # --- optional egocentric occupancy grid ---
+    # A robot-centred, heading-aligned top-down obstacle map (the obs learned local-nav
+    # policies actually use, and the same representation the pipeline emits as `*_occupancy.png`
+    # — so a trained policy could later consume a real reconstructed map). 0 disables it; else an
+    # `occupancy_size`×`occupancy_size` grid covering `occupancy_extent` metres, flattened
+    # row-major (local +x forward = increasing row), 1.0 = occupied/out-of-bounds, 0.0 = free.
+    occupancy_size: int = 0            # 0 disables; else N -> N*N cells appended to the obs
+    occupancy_extent: float = 4.0      # side length (m) of the square the grid covers
+
     def obstacle_array(self) -> np.ndarray:
         """Obstacles as a contiguous (N, 3) float array (empty (0, 3) if none)."""
         if self.obstacles is None:
@@ -138,7 +149,7 @@ class DiffDriveNavEnv:
         self.cfg = cfg or NavSimConfig()
         self._obstacles = self.cfg.obstacle_array()
         self.act_dim = ACT_DIM
-        self.obs_dim = OBS_DIM + self.cfg.n_lidar_beams
+        self.obs_dim = OBS_DIM + self.cfg.n_lidar_beams + self.cfg.occupancy_size ** 2
         # Symmetric action limits, handy for a Gymnasium Box space when wrapped later.
         self.action_low = np.array([-self.cfg.max_lin_vel, -self.cfg.max_ang_vel], np.float32)
         self.action_high = np.array([self.cfg.max_lin_vel, self.cfg.max_ang_vel], np.float32)
@@ -186,12 +197,37 @@ class DiffDriveNavEnv:
             out[i] = dist / self.cfg.lidar_range
         return out
 
+    def _occupancy_grid(self) -> np.ndarray:
+        """Egocentric top-down occupancy map, flattened (empty if disabled).
+
+        An `N×N` grid centred on the robot and rotated into its frame (local +x forward =
+        increasing row, local +y left = increasing col), covering `occupancy_extent` metres.
+        A cell is 1.0 if its centre falls inside any obstacle circle or outside the world
+        bounds, else 0.0. Fully vectorised over cells and obstacles.
+        """
+        n = self.cfg.occupancy_size
+        if n == 0:
+            return np.zeros(0, np.float32)
+        half = self.cfg.occupancy_extent / 2.0
+        coords = np.linspace(-half, half, n)
+        lx, ly = np.meshgrid(coords, coords, indexing="ij")     # local (forward, left)
+        c, s = np.cos(self._heading), np.sin(self._heading)
+        wx = self._x + c * lx - s * ly                          # rotate local->world + translate
+        wy = self._y + s * lx + c * ly
+        x_min, y_min, x_max, y_max = self.cfg.bounds
+        occ = (wx < x_min) | (wx > x_max) | (wy < y_min) | (wy > y_max)
+        for cx, cy, r in self._obstacles:
+            occ |= (wx - cx) ** 2 + (wy - cy) ** 2 <= r * r
+        return occ.astype(np.float32).reshape(-1)
+
     def _make_obs(self) -> np.ndarray:
-        base = observation(self.robot_xy, self._heading, self._goal,
-                           self._lin_vel, self._ang_vel)
-        if self.cfg.n_lidar_beams == 0:
-            return base
-        return np.concatenate([base, self._lidar()]).astype(np.float32)
+        parts = [observation(self.robot_xy, self._heading, self._goal,
+                             self._lin_vel, self._ang_vel)]
+        if self.cfg.n_lidar_beams:
+            parts.append(self._lidar())
+        if self.cfg.occupancy_size:
+            parts.append(self._occupancy_grid())
+        return np.concatenate(parts).astype(np.float32)
 
     def _sample_free_xy(self) -> np.ndarray:
         """Uniformly sample a collision-free point inside the (radius-shrunk) bounds."""
