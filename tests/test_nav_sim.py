@@ -259,6 +259,70 @@ def test_random_field_env_is_collision_free_at_reset():
     assert not env._collides(env.robot_xy) and not info["collided"]
 
 
+def test_occupancy_grid_shape_dim_and_binary():
+    cfg = _open_field(occupancy_size=9, occupancy_extent=4.0)
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    assert env.obs_dim == OBS_DIM + 9 * 9
+    assert obs.shape == (OBS_DIM + 81,)
+    grid = obs[OBS_DIM:]
+    assert set(np.unique(grid)).issubset({0.0, 1.0})     # occupancy is binary
+
+
+def test_occupancy_grid_combines_with_lidar_in_order():
+    # obs layout must be [nav_task(7)] + [lidar] + [occupancy] so avoidance's lidar slice holds.
+    cfg = _open_field(n_lidar_beams=5, occupancy_size=7)
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    assert env.obs_dim == OBS_DIM + 5 + 49
+    assert obs.shape == (OBS_DIM + 5 + 49,)
+    lidar = obs[OBS_DIM:OBS_DIM + 5]
+    assert np.all((lidar >= 0.0) & (lidar <= 1.0))
+
+
+def test_occupancy_grid_senses_obstacle_ahead_not_behind():
+    # Robot at origin facing +x; obstacle straight ahead -> occupancy in the forward half,
+    # robot's own cell free, back half clear. Grid is [row=local forward, col=local left].
+    cfg = NavSimConfig(fixed_start=(0.0, 0.0, 0.0), fixed_goal=(4.0, 0.0),
+                       bounds=(-6.0, -6.0, 6.0, 6.0), obstacles=np.array([[1.5, 0.0, 0.4]]),
+                       occupancy_size=11, occupancy_extent=4.0)
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    grid = obs[OBS_DIM:].reshape(11, 11)
+    c = 11 // 2
+    assert grid[c, c] == 0.0, "robot's own cell should be free"
+    assert grid[c + 1:, :].sum() > 0, "obstacle ahead -> forward half occupied"
+    assert grid[:c, :].sum() == 0.0, "nothing behind -> back half free"
+
+
+def test_occupancy_grid_is_heading_egocentric():
+    # Same world obstacle ahead in +x; the occupied region must rotate with the robot's heading.
+    obs_cfg = dict(fixed_start=(0.0, 0.0, 0.0), fixed_goal=(4.0, 0.0),
+                   bounds=(-6.0, -6.0, 6.0, 6.0), obstacles=np.array([[1.5, 0.0, 0.4]]),
+                   occupancy_size=11, occupancy_extent=4.0)
+    c = 11 // 2
+
+    env0 = DiffDriveNavEnv(NavSimConfig(**obs_cfg))
+    g0 = env0.reset(seed=0)[0][OBS_DIM:].reshape(11, 11)
+    # facing away (+pi): the same obstacle is now behind -> occupancy in the back half.
+    obs_cfg_back = dict(obs_cfg, fixed_start=(0.0, 0.0, np.pi))
+    envb = DiffDriveNavEnv(NavSimConfig(**obs_cfg_back))
+    gb = envb.reset(seed=0)[0][OBS_DIM:].reshape(11, 11)
+
+    assert g0[c + 1:, :].sum() > g0[:c, :].sum()          # ahead when facing it
+    assert gb[:c, :].sum() > gb[c + 1:, :].sum()          # behind when facing away
+
+
+def test_occupancy_grid_marks_out_of_bounds_as_occupied():
+    # Robot in the corner of a small room: cells beyond the walls must read occupied.
+    cfg = NavSimConfig(fixed_start=(1.6, 1.6, 0.0), fixed_goal=(-1.0, -1.0),
+                       bounds=(-2.0, -2.0, 2.0, 2.0), occupancy_size=9, occupancy_extent=3.0)
+    env = DiffDriveNavEnv(cfg)
+    obs, _ = env.reset(seed=0)
+    grid = obs[OBS_DIM:]
+    assert grid.sum() > 0, "cells past the nearby walls should be marked occupied"
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
