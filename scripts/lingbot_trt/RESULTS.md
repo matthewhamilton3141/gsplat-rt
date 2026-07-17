@@ -185,24 +185,29 @@ op survives in the graph.** (The scaffold's first wrapper was wrong twice: it re
 
 Measured, one block (index 0, first-decode call: 1042 tokens, 8→9 frame cache, mean of 200):
 
-| config | ms / block (median) | note |
-|---|---|---|
-| TRT **fp32/TF32** | 8.50 | no tensor cores on the big SDPA |
-| **torch bf16** (production baseline) | **2.76** | bf16 autocast, complex RoPE |
-| **TRT fp16** | **2.28** | parity vs ORT-fp32 = 2.0e-2 (ok for fp16) |
+| config | ms / block (median) | per-block | note |
+|---|---|---|---|
+| TRT **fp32/TF32** | 8.50 | 0.36× | no tensor cores on the big SDPA |
+| **torch bf16** (production baseline) | **2.76** | 1.00× | bf16 autocast, complex RoPE |
+| TRT fp16 **weakly-typed** (fp32 I/O) | 2.28 | 1.21× | parity vs ORT-fp32 = 2.0e-2 |
+| **TRT fp16 strongly-typed** | **1.80** | **1.53×** | true fp16 ONNX, no I/O casts; parity 1.9e-2 |
+| TRT bf16 strongly-typed | 1.82 | 1.52× | ~tied; ORT-CPU can't verify bf16 parity |
 
-- Export parity (fp32 wrapper vs bf16 capture): `mean|Δ|=3.2e-5`, `max|Δ|=1.1e-2` (bf16 noise).
-- **Per-block TRT-fp16 vs torch-bf16 = 1.21×** — **below** the 1.76× that Step-1.5 assumed.
-- Whole-model Amdahl with the *measured* 1.21×: `1/(0.548 + 0.452/1.21) ≈` **1.09×**
-  (ceiling unchanged at 1.82×). **Correcting the Step-1.5 ~1.24× projection down** — it
-  assumed a Stage-4-like 1.76× per-block kernel gain; the real global-block gain is 1.21×.
+- Export parity (fp32 wrapper vs bf16 capture): `mean|Δ|=3.2e-5`, `max|Δ|=1.1e-2` (bf16 noise);
+  the true-fp16 export holds at `mean|Δ|=8.9e-5`.
+- **Per-block best = 1.53×** (strongly-typed fp16). The weakly-typed engine's fp32 I/O +
+  boundary cast nodes were the handicap; a true fp16 ONNX built strongly-typed drops them
+  (2.28 → 1.80 ms, a further 1.27× *within* TRT). fp16 beats bf16 by a hair and, unlike bf16,
+  its parity is CPU-verifiable — so fp16 strongly-typed is the pick.
+- Whole-model Amdahl with the measured **1.53×**: `1/(0.548 + 0.452/1.53) ≈` **1.19×** (ceiling
+  1.82×). This recovers most of the Step-1.5 ~1.24× projection — that estimate assumed a 1.76×
+  per-block gain; the real strongly-typed gain is 1.53×, so ~1.19× is the honest whole-model
+  number to carry (the earlier 1.09× was the weakly-typed engine before this lever).
 
 ## What's next (not done)
-- **Raise the per-block gain before integrating.** The fp16 engine has **fp32 I/O with
-  boundary cast nodes** (weakly-typed). Levers, cheapest first: (a) a true fp16 ONNX +
-  `--strongly-typed` to drop the casts; (b) INT8 (calibration npz already dumped by the
-  exporter → `--calib-npz`); (c) the KV-cache-engine idea. Re-measure per-block, then
-  recompute the whole-model projection.
+- **Per-block lever done (1.21× → 1.53× via strongly-typed fp16).** Remaining upside: INT8
+  (calibration npz already dumped by the exporter → `--calib-npz`, though the block is
+  attention/softmax-bound so expect ≤10–20%); the KV-cache-engine idea.
 - **Integrate all 24 blocks** (`integrate_e2e.py` pattern) + whole-model fps vs the bf16
   baseline with the NaN-aware parity harness — only worth it once the per-block gain and
   the dynamic-cache-length engine (currently static at 9 frames) are settled.
