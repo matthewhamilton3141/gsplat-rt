@@ -142,6 +142,9 @@ def main() -> int:
     ap.add_argument("--onnx", required=True)
     ap.add_argument("--engine-out", default=None, help="save the serialized engine here")
     ap.add_argument("--no-fp16", action="store_true", help="build FP32/TF32 instead of FP16")
+    ap.add_argument("--bf16", action="store_true",
+                    help="BF16 builder flag (matmuls bf16, norms/softmax stay fp32 — mirrors "
+                         "autocast); takes precedence over fp16 for a faithful bf16 baseline")
     ap.add_argument("--strongly-typed", action="store_true",
                     help="precision from the ONNX dtypes (use with a fp16 ONNX; no cast nodes)")
     ap.add_argument("--int8", action="store_true",
@@ -169,7 +172,8 @@ def main() -> int:
             return 2
         calibrator = make_calibrator(args.calib_npz, args.calib_cache, trt)
     engine_bytes = build_engine(args.onnx, not args.no_fp16, args.strongly_typed,
-                                args.int8, calibrator, args.workspace_gb, logger, trt)
+                                args.int8, calibrator, args.workspace_gb, logger, trt,
+                                bf16=args.bf16)
     if args.engine_out:
         with open(args.engine_out, "wb") as f:
             f.write(engine_bytes)

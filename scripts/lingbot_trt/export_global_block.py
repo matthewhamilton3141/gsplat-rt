@@ -131,6 +131,10 @@ def main() -> int:
     ap.add_argument("--bench-torch", type=int, default=0, metavar="ITERS",
                     help="time the original torch block (bf16 autocast, complex RoPE) on the "
                          "captured inputs = the production baseline the TRT engine replaces")
+    ap.add_argument("--half", choices=["fp16", "bf16"], default=None,
+                    help="export a TRUE half-precision ONNX (activations+weights+cache in this "
+                         "dtype, pos stays fp32) so build_and_bench_trt.py --strongly-typed drops "
+                         "the fp32 I/O boundary casts; default fp32 ONNX")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.abspath(args.lingbot_root))
@@ -356,8 +360,14 @@ def _attempt_export(block, cap, changed, args, torch):
     import numpy as np
     import lingbot_map.layers.attention as _attn_mod
 
+    # Export dtype: default fp32 (portable ONNX, TRT builds fp16/bf16 from it with a builder
+    # flag = fp32 I/O + boundary casts). --half fp16|bf16 emits a TRUE half ONNX so a
+    # --strongly-typed engine drops those I/O casts — the per-block lever. pos stays fp32
+    # (RoPE cos/sin are precision-sensitive; only a couple of small tensors).
+    export_dt = {None: torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[args.half]
+
     device = next(block.parameters()).device
-    block = block.float().eval()
+    block = block.to(dtype=export_dt).eval()
     idx = int(cap["kwargs"].get("global_idx", args.index))
     kkey, vkey = f"k_{idx}", f"v_{idx}"
 
@@ -366,13 +376,15 @@ def _attempt_export(block, cap, changed, args, torch):
         print(f"ERROR: {kkey} not in cache_before ({list(cb)[:6]}...); cannot form cache input.")
         return 2
 
-    # graph inputs — all float32, on device (pre-write cache = 8 frames)
-    x_in = cap["args"][0].to(device=device, dtype=torch.float32)
+    # graph inputs on device (pre-write cache = 8 frames). Activations/cache in export_dt;
+    # pos kept fp32 for RoPE stability.
+    x_in = cap["args"][0].to(device=device, dtype=export_dt)
     pos = cap["kwargs"]["pos"]
     pos_real = torch.stack([pos.real, pos.imag], dim=-1).to(device=device, dtype=torch.float32)
-    k_in = cb[kkey][2].to(device=device, dtype=torch.float32)
-    v_in = cb[vkey][2].to(device=device, dtype=torch.float32)
+    k_in = cb[kkey][2].to(device=device, dtype=export_dt)
+    v_in = cb[vkey][2].to(device=device, dtype=export_dt)
     tensor_ins = (x_in, pos_real, k_in, v_in)
+    print(f"export dtype = {export_dt}")
 
     # baked scalar kwargs (everything that isn't a tensor or the kv_cache dict)
     const_kw = {kk: vv for kk, vv in cap["kwargs"].items()
@@ -434,10 +446,10 @@ def _attempt_export(block, cap, changed, args, torch):
 
     io_path = os.path.splitext(args.onnx_out)[0] + "_io.npz"
     np.savez(io_path,
-             x=x_in.cpu().numpy(), pos=pos_real.cpu().numpy(),
-             k_in=k_in.cpu().numpy(), v_in=v_in.cpu().numpy(),
-             out=ref[0].float().cpu().numpy(),
-             k_out=ref[-2].float().cpu().numpy(), v_out=ref[-1].float().cpu().numpy())
+             x=_to_numpy(x_in, torch), pos=_to_numpy(pos_real, torch),
+             k_in=_to_numpy(k_in, torch), v_in=_to_numpy(v_in, torch),
+             out=_to_numpy(ref[0], torch),
+             k_out=_to_numpy(ref[-2], torch), v_out=_to_numpy(ref[-1], torch))
     print(f"EXPORT OK -> {args.onnx_out}  (+ real I/O {io_path})")
     print("Next: build_and_bench_trt.py (fp32 + fp16), NaN-aware parity vs this npz, then "
           "integrate all 24 blocks (integrate_e2e.py pattern).")
