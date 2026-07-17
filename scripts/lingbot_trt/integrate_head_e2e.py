@@ -93,15 +93,21 @@ def _make_trt_head(orig, engine_bytes, in_names, out_names, out_template, trt, l
     if context is None:
         raise RuntimeError("create_execution_context returned None (GPU OOM?)")
 
+    # The engine is authoritative: TRT may constant-fold an input away (e.g. `images` is only
+    # used to fix the output resolution, which bakes to a constant), so bind only what it has.
     in_dtypes, out_dtypes, exp_shapes = {}, {}, {}
+    engine_in, engine_out = [], []
     for i in range(engine.num_io_tensors):
         name = engine.get_tensor_name(i)
         dt = _trt_to_torch(trt, engine.get_tensor_dtype(name))
         if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
             in_dtypes[name] = dt
             exp_shapes[name] = tuple(engine.get_tensor_shape(name))
+            engine_in.append(name)
         else:
             out_dtypes[name] = dt
+            engine_out.append(name)
+    engine_out.sort()          # out0, out1, ... -> matches the flattened head-output order
 
     class TRTHead(torch.nn.Module):
         def __init__(self):
@@ -115,31 +121,28 @@ def _make_trt_head(orig, engine_bytes, in_names, out_names, out_template, trt, l
             feats = list(a0) if isinstance(a0, (list, tuple)) else [a0]
             tkw = {k: v for k, v in kwargs.items() if torch.is_tensor(v)}
             # assemble inputs in the exported name order
-            named = {}
-            for i, f in enumerate(feats):
-                named[f"feat{i}"] = f
+            named = {f"feat{i}": f for i, f in enumerate(feats)}
             named.update(tkw)
-            if any(n not in named or tuple(named[n].shape) != exp_shapes[n] for n in in_names):
+            if any(n not in named or tuple(named[n].shape) != exp_shapes[n] for n in engine_in):
                 self.n_fallback += 1                     # off-shape (e.g. short final chunk)
                 return self.orig(*args, **kwargs)
 
             held = []
-            for name in in_names:
+            for name in engine_in:
                 t = named[name].to(in_dtypes[name]).contiguous()
                 held.append(t)
                 context.set_input_shape(name, tuple(t.shape))
                 context.set_tensor_address(name, t.data_ptr())
             out_bufs = {n: torch.empty(tuple(context.get_tensor_shape(n)), dtype=out_dtypes[n],
-                                       device="cuda") for n in out_names}
-            for n in out_names:
+                                       device="cuda") for n in engine_out}
+            for n in engine_out:
                 context.set_tensor_address(n, out_bufs[n].data_ptr())
             stream = torch.cuda.current_stream()
             context.execute_async_v3(stream_handle=stream.cuda_stream)
             self.n_trt += 1
             # rebuild the head's original output structure (tuple/list) from the engine outputs
-            outs = [out_bufs[n] for n in out_names]
             from integrate_e2e import _rebuild
-            return _rebuild(out_template, iter(outs))
+            return _rebuild(out_template, iter(out_bufs[n] for n in engine_out))
 
     return TRTHead()
 
