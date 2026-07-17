@@ -125,6 +125,9 @@ def main() -> int:
     ap.add_argument("--dump-io", default=None, help="save captured inputs+outputs to this .npz")
     ap.add_argument("--opset", type=int, default=18)
     ap.add_argument("--no-export", action="store_true", help="Phase 1 discovery only, skip export")
+    ap.add_argument("--dynamic-cache", action="store_true",
+                    help="mark the cache history dim (dim 2) dynamic; default static so "
+                         "build_and_bench_trt.py's fixed-shape path benches it directly")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.abspath(args.lingbot_root))
@@ -361,7 +364,8 @@ def _attempt_export(block, cap, changed, args, torch):
             + [f"{kkey}_out", f"{vkey}_out"]
         in_names = ["x", "pos", f"{kkey}_in", f"{vkey}_in"]
         dyn = {f"{kkey}_in": {2: "hist"}, f"{vkey}_in": {2: "hist"},
-               f"{kkey}_out": {2: "hist1"}, f"{vkey}_out": {2: "hist1"}}
+               f"{kkey}_out": {2: "hist1"}, f"{vkey}_out": {2: "hist1"}} \
+            if args.dynamic_cache else None
         print(f"exporting -> {args.onnx_out} (opset {args.opset}) ...")
         try:
             torch.onnx.export(
