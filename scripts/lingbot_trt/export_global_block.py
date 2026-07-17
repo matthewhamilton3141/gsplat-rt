@@ -276,87 +276,117 @@ def _slot_name(i, k):
     return f"arg{k}" if isinstance(k, int) else str(k)
 
 
+def _report_parity(label, a, b, np):
+    """Print max/mean abs + relative diff and NaN counts for two same-shape arrays."""
+    if a.shape != b.shape:
+        print(f"  parity[{label}]: SHAPE MISMATCH {a.shape} vs {b.shape}")
+        return
+    a64, b64 = a.astype(np.float64), b.astype(np.float64)
+    diff = np.abs(a64 - b64)
+    rel = diff / (np.abs(b64) + 1e-6)
+    print(f"  parity[{label}]: max|Δ|={np.nanmax(diff):.3e} mean|Δ|={np.nanmean(diff):.3e} "
+          f"maxrel={np.nanmax(rel):.3e}  nan(a/b)={int(np.isnan(a).sum())}/{int(np.isnan(b).sum())}")
+
+
 def _attempt_export(block, cap, changed, args, torch):
-    """Build the functional wrapper and export it. Kept separate so Phase 1 is safe."""
-    # Graph inputs = every tensor in the call EXCEPT the kv_cache dict (handled specially),
-    # with complex tensors split into (real, imag) real inputs at the boundary.
-    in_specs = []          # (key, is_complex)
-    tensor_ins = []        # the real torch tensors fed to export
-    for k, v in _iter_call(cap, torch):
-        if not torch.is_tensor(v):
-            continue
-        if v.is_complex():
-            in_specs.append((k, True))
-            tensor_ins.append(torch.view_as_real(v)[..., 0].contiguous())  # real part
-            tensor_ins.append(torch.view_as_real(v)[..., 1].contiguous())  # imag part
-        else:
-            in_specs.append((k, False))
-            tensor_ins.append(v)
+    """Functional float32 export of one SDPA global_block, complex RoPE removed.
 
-    # This block's cache slot: pass the changed (written) keys IN as current-cache inputs so
-    # the concat/grow happens against real tensors; return them OUT as the updated cache.
-    cache_keys = list(changed)
-    kv = cap["kwargs"].get("kv_cache")
-    for name in cache_keys:
-        tensor_ins.append(kv[name])
+    Phase-1 discovery pinned the exact contract:
+      * `pos` (complex128 freqs_cis) is consumed ONLY by apply_rotary_emb, which needs just
+        cos/sin (= pos.real / pos.imag). We feed it as a real [..., 2] tensor and swap in a
+        real-input apply_rotary_emb -> no complex op survives in the graph.
+      * The block reads/writes only its own slot k_{idx}/v_{idx}; here it appends the current
+        frame (dim-2 8->9). We feed the PRE-write cache (cache_before) so the graph's cat
+        produces the grown cache as an explicit output.
+    Exported in float32 for a portable ONNX; TRT still builds fp16/bf16 from it.
+    """
+    import numpy as np
+    import lingbot_map.layers.attention as _attn_mod
 
-    baked_args = list(cap["args"])
-    baked_kwargs = dict(cap["kwargs"])
+    device = next(block.parameters()).device
+    block = block.float().eval()
+    idx = int(cap["kwargs"].get("global_idx", args.index))
+    kkey, vkey = f"k_{idx}", f"v_{idx}"
+
+    cb = cap["cache_before"]
+    if kkey not in cb:
+        print(f"ERROR: {kkey} not in cache_before ({list(cb)[:6]}...); cannot form cache input.")
+        return 2
+
+    # graph inputs — all float32, on device (pre-write cache = 8 frames)
+    x_in = cap["args"][0].to(device=device, dtype=torch.float32)
+    pos = cap["kwargs"]["pos"]
+    pos_real = torch.stack([pos.real, pos.imag], dim=-1).to(device=device, dtype=torch.float32)
+    k_in = cb[kkey][2].to(device=device, dtype=torch.float32)
+    v_in = cb[vkey][2].to(device=device, dtype=torch.float32)
+    tensor_ins = (x_in, pos_real, k_in, v_in)
+
+    # baked scalar kwargs (everything that isn't a tensor or the kv_cache dict)
+    const_kw = {kk: vv for kk, vv in cap["kwargs"].items()
+                if not (torch.is_tensor(vv) or isinstance(vv, dict))}
+
+    def _rope_real(t, freqs):  # real-arithmetic RoPE; freqs = [..., D//2, 2] (cos, sin)
+        cos = freqs[..., 0].to(t.dtype)
+        sin = freqs[..., 1].to(t.dtype)
+        t1, t2 = t[..., 0::2], t[..., 1::2]
+        return torch.stack([t1 * cos - t2 * sin, t1 * sin + t2 * cos], dim=-1).reshape(t.shape)
 
     class Wrapper(torch.nn.Module):
         def __init__(self, mod):
             super().__init__()
             self.mod = mod
 
-        def forward(self, *tins):
-            it = iter(tins)
-            a = list(baked_args)
-            kwd = dict(baked_kwargs)
-            for (key, is_cplx) in in_specs:
-                if is_cplx:
-                    re, im = next(it), next(it)
-                    val = torch.complex(re.to(torch.float64), im.to(torch.float64))
-                else:
-                    val = next(it)
-                if isinstance(key, int):
-                    a[key] = val
-                else:
-                    kwd[key] = val
-            # rebuild the kv_cache with this block's slot taken from the inputs
-            new_kv = dict(kv) if isinstance(kv, dict) else {}
-            for name in cache_keys:
-                new_kv[name] = next(it)
-            if isinstance(kv, dict):
-                kwd["kv_cache"] = new_kv
-            out = self.mod(*a, **kwd)
+        def forward(self, x, pos_r, k_cur, v_cur):
+            kv = {kkey: k_cur, vkey: v_cur,
+                  f"{kkey}_special": None, f"{vkey}_special": None}
+            out = self.mod(x, pos=pos_r, kv_cache=kv, **const_kw)
             outs = list(_flatten_tensors(out))
-            # append the updated cache tensors as explicit outputs (functional contract)
-            for name in cache_keys:
-                if name in new_kv and torch.is_tensor(new_kv[name]):
-                    outs.append(new_kv[name])
-            return tuple(outs)
+            return tuple(outs) + (kv[kkey], kv[vkey])
 
     wrapper = Wrapper(block).eval()
-    with torch.no_grad():
-        ref = wrapper(*tensor_ins)
-    print(f"reference forward OK — {len(ref)} output tensor(s): {[tuple(t.shape) for t in ref]}")
-
-    in_names = [f"in{i}" for i in range(len(tensor_ins))]
-    out_names = [f"out{i}" for i in range(len(ref))]
-    print(f"exporting -> {args.onnx_out} (opset {args.opset}, classic TorchScript) ...")
+    _orig_are = _attn_mod.apply_rotary_emb
+    _attn_mod.apply_rotary_emb = _rope_real
     try:
-        torch.onnx.export(
-            wrapper, tuple(tensor_ins), args.onnx_out,
-            input_names=in_names, output_names=out_names,
-            opset_version=args.opset, do_constant_folding=True, dynamo=False,
-        )
-    except Exception as e:
-        print(f"\nONNX EXPORT FAILED: {type(e).__name__}: {e}")
-        print("Expected first-pass outcome — the op it names (likely the complex RoPE / "
-              "SDPA) is the exact thing to refactor to real ops. Report it back.")
-        return 1
-    print("EXPORT OK. Next: build TRT (build_and_bench_trt.py) + NaN-aware parity vs the "
-          "dumped I/O, then integrate all 24 blocks (integrate_e2e.py pattern).")
+        with torch.no_grad():
+            ref = wrapper(*tensor_ins)
+        print(f"reference forward OK — {len(ref)} outputs: {[tuple(t.shape) for t in ref]}")
+
+        if cap.get("out") is not None:
+            _report_parity("block-out fp32-wrapper vs bf16-capture",
+                           ref[0].float().cpu().numpy(),
+                           _to_numpy(_flatten_tensors(cap["out"])[0], torch), np)
+
+        n_main = len(ref) - 2
+        out_names = ([f"out{i}" for i in range(n_main)] if n_main != 1 else ["out"]) \
+            + [f"{kkey}_out", f"{vkey}_out"]
+        in_names = ["x", "pos", f"{kkey}_in", f"{vkey}_in"]
+        dyn = {f"{kkey}_in": {2: "hist"}, f"{vkey}_in": {2: "hist"},
+               f"{kkey}_out": {2: "hist1"}, f"{vkey}_out": {2: "hist1"}}
+        print(f"exporting -> {args.onnx_out} (opset {args.opset}) ...")
+        try:
+            torch.onnx.export(
+                wrapper, tensor_ins, args.onnx_out,
+                input_names=in_names, output_names=out_names, dynamic_axes=dyn,
+                opset_version=args.opset, do_constant_folding=True, dynamo=False,
+            )
+        except Exception as e:
+            print(f"\nONNX EXPORT FAILED: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            print("The op it names is the next thing to make real/traceable. Report it back.")
+            return 1
+    finally:
+        _attn_mod.apply_rotary_emb = _orig_are
+
+    io_path = os.path.splitext(args.onnx_out)[0] + "_io.npz"
+    np.savez(io_path,
+             x=x_in.cpu().numpy(), pos=pos_real.cpu().numpy(),
+             k_in=k_in.cpu().numpy(), v_in=v_in.cpu().numpy(),
+             out=ref[0].float().cpu().numpy(),
+             k_out=ref[-2].float().cpu().numpy(), v_out=ref[-1].float().cpu().numpy())
+    print(f"EXPORT OK -> {args.onnx_out}  (+ real I/O {io_path})")
+    print("Next: build_and_bench_trt.py (fp32 + fp16), NaN-aware parity vs this npz, then "
+          "integrate all 24 blocks (integrate_e2e.py pattern).")
     return 0
 
 
