@@ -116,11 +116,30 @@ python scripts/eval_odometry.py --frontend superpoint --provider tensorrt   # 3.
 
 ## Related experiments
 
-- **LingBot-Map → TensorRT** — a separate optimization study taking a VGGT-style streaming reconstruction foundation model to TensorRT. Measured **1.76× FP16 per block** (kernel fusion at equal precision), an honest INT8 negative result, and a full **end-to-end integration** swapping all 24 aggregator blocks that quantifies why the per-block win *doesn't* translate whole-model (~1.08×) — the frame blocks aren't the bottleneck. Getting a correct number took dynamic-batch optimization profiles, current-stream execution (fixing a precision-independent NaN race), autocast mixed-precision matching, and shared TRT device memory. See [`scripts/lingbot_trt/RESULTS.md`](scripts/lingbot_trt/RESULTS.md).
+### Reconstructed-scene navigation (RL flagship)
+
+![A PPO policy navigating random obstacle fields via lidar](docs/nav_ppo_policy.gif)
+
+*A PPO policy (trained from scratch, 1.5M steps) driving to the goal through randomized obstacle fields using a 16-beam lidar observation — [full MP4 →](docs/nav_ppo_policy.mp4).*
+
+The endpoint of the pipeline is a scene a robot can *act* in, so this milestone closes the loop: a differential-drive agent that learns to navigate. Built backend-agnostic — a pure-NumPy env + task core (`src/isaac/nav_sim.py`, fully unit-tested on a laptop, 22 tests) with a thin `gymnasium` shell, so a PyBullet / Isaac Lab port is an adapter, not a rewrite.
+
+- **Hand-written baseline:** a lidar follow-the-gap controller — 35/40 random scenes solved, **0 collisions** (vs a blind go-to-goal's 12/40, 28 collisions).
+- **Learned policy (PPO, stable-baselines3):** **98%** reached on held-out random scenes (matches the heuristic) while reaching **~40% faster** — the classic efficiency-vs-safety trade a learned policy discovers (it trades the heuristic's perfect safety for a small 2% collision rate). Measured, A10G.
+
+### LingBot-Map → TensorRT (optimization study)
+
+A separate, measurement-driven study taking a **VGGT-style streaming reconstruction foundation model** to TensorRT — every figure reproduced on an A10G, nothing assumed. The honest arc:
+
+- **Profiled first.** A CUDA-event runtime split found the KV-cache `global_blocks` (45%) + DPT/camera heads (17.5%) dominate — *not* the frame blocks. This is why the initial Stage-4 experiment (all 24 frame blocks → TRT) only moved the whole model ~1.08×: the per-block 1.76× fusion win doesn't translate when you optimize the wrong thing.
+- **Then optimized the real bottlenecks, per component → measured whole-model:** the stateful `global_blocks` (complex-RoPE + growing KV cache) at **1.53× per block → 1.069× whole-model**, and the static **DPT head at 2.93× per head → 1.098× whole-model** (parity-verified, 0 NaN). Notably the *smaller* head chunk won *more* end-to-end — because static work translates cleanly where the dynamic-cache blocks pay integration overhead.
+- Getting correct numbers took real engineering: dynamic optimization profiles (batch *and* cache-length), current-stream execution (fixing a precision-independent NaN race), a real-valued RoPE refactor to escape complex-dtype ONNX, and engine-authoritative I/O binding.
+
+See [`scripts/lingbot_trt/RESULTS.md`](scripts/lingbot_trt/RESULTS.md).
 
 ## Tech stack
 
-Python · PyTorch · TensorRT · custom CUDA · OpenUSD · OpenCV · NumPy — targeting NVIDIA Isaac Sim / Omniverse.
+Python · PyTorch · TensorRT · custom CUDA · OpenUSD · OpenCV · NumPy · stable-baselines3 / Gymnasium (RL) — targeting NVIDIA Isaac Sim / Omniverse.
 
 ## License
 
