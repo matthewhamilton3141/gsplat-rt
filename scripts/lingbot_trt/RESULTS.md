@@ -143,11 +143,77 @@ Each of these was measured, not assumed — the naive swap was wrong in four sep
    28 GB > the A10G's 22.5 GB. The blocks run sequentially on one stream, so they share
    **one** device-memory scratch (sized to the largest engine) — 24×1.2 GB → 1×1.2 GB.
 
+## Stage 5, Step 1.5 — measured runtime split (the go/no-go gate)
+Before writing any `global_blocks` export, `runtime_split.py` CUDA-event-timed one real
+`inference_windowed` (48 frames, window 16, mean of 3 runs on the A10G) to settle where the
+time actually goes — a perfect block engine is worthless if it isn't the bottleneck (the
+Stage-4 lesson). And a **structure probe** (`probe_global_blocks.py`) first confirmed the KV
+cache is **functional** (passed as an arg, not mutating module state) → the cleanest export
+branch; the dynamic axis is the sequence/token length (prefill 8336 → decode 1042 tokens).
+
+| group | ms / windowed forward | share |
+|---|---|---|
+| **global_blocks** (KV-cache attention) | **2820.7** | **45.2%** |
+| frame_blocks (Stage-4 target) | 1398.2 | 22.4% |
+| heads (DPT depth + camera) | 1090.7 | 17.5% |
+| rest (patch embed / RoPE / norm / proj / overhead) | 937.5 | 15.0% |
+| **TOTAL** | **6247.1** | 100% |
+
+**Verdict: GO.** `global_blocks` are the single largest cost at **45.2%** — this is exactly
+why Stage 4's frame-block engine (22.4% of runtime) only moved the whole model ~1.08×. The
+honest Amdahl framing: a *perfect* (zero-cost) `global_blocks` caps whole-model at **1.82×**
+(6247 / 3426); at a Stage-4-like **1.76× per-block** kernel speedup the realistic whole-model
+gain is **~1.24×** (gb 2820→1603 ms), rising to ~1.43× if the cache engine hits 3×. So this
+is the first LingBot target with a defensible whole-model win — because it's where the time
+is, not just where the fusion looked good in isolation. (⚠ export snag noted for Step 2: `pos`
+is `complex128` RoPE — TRT/ONNX have no complex dtype, so RoPE must be applied as real cos/sin
+ops or precomputed outside the engine.)
+
+## Stage 5, Step 2 — `global_blocks` export LANDED + measured (A10G)
+`export_global_block.py` exports one `global_blocks[i]` (an `SDPAAttention` block) to a
+functional ONNX and `build_and_bench_trt.py` builds + benches it. The block is
+`f(x, pos, k_in, v_in) -> (out, k_out, v_out)`; the 8-frame cache grows to 9 in-graph
+(`torch.cat` on the frame axis), returned as explicit outputs.
+
+**The complex-RoPE snag was smaller than feared.** Phase-1 discovery showed `pos`
+(`complex128` freqs_cis) is consumed **only** by `apply_rotary_emb`, which already runs
+real arithmetic and just reads `pos.real`/`pos.imag`. Fix: feed `pos` as a real `[…,2]`
+(cos, sin) tensor and monkeypatch `apply_rotary_emb` to a real-input variant — **no complex
+op survives in the graph.** (The scaffold's first wrapper was wrong twice: it rebuilt a
+`torch.complex` *inside* the graph, re-adding the unexportable op, and fed the post-mutation
+9-frame cache so the graph would `cat` to 10 — fixed to feed the pre-write 8-frame snapshot.)
+
+Measured, one block (index 0, first-decode call: 1042 tokens, 8→9 frame cache, mean of 200):
+
+| config | ms / block (median) | per-block | note |
+|---|---|---|---|
+| TRT **fp32/TF32** | 8.50 | 0.36× | no tensor cores on the big SDPA |
+| **torch bf16** (production baseline) | **2.76** | 1.00× | bf16 autocast, complex RoPE |
+| TRT fp16 **weakly-typed** (fp32 I/O) | 2.28 | 1.21× | parity vs ORT-fp32 = 2.0e-2 |
+| **TRT fp16 strongly-typed** | **1.80** | **1.53×** | true fp16 ONNX, no I/O casts; parity 1.9e-2 |
+| TRT bf16 strongly-typed | 1.82 | 1.52× | ~tied; ORT-CPU can't verify bf16 parity |
+
+- Export parity (fp32 wrapper vs bf16 capture): `mean|Δ|=3.2e-5`, `max|Δ|=1.1e-2` (bf16 noise);
+  the true-fp16 export holds at `mean|Δ|=8.9e-5`.
+- **Per-block best = 1.53×** (strongly-typed fp16). The weakly-typed engine's fp32 I/O +
+  boundary cast nodes were the handicap; a true fp16 ONNX built strongly-typed drops them
+  (2.28 → 1.80 ms, a further 1.27× *within* TRT). fp16 beats bf16 by a hair and, unlike bf16,
+  its parity is CPU-verifiable — so fp16 strongly-typed is the pick.
+- Whole-model Amdahl with the measured **1.53×**: `1/(0.548 + 0.452/1.53) ≈` **1.19×** (ceiling
+  1.82×). This recovers most of the Step-1.5 ~1.24× projection — that estimate assumed a 1.76×
+  per-block gain; the real strongly-typed gain is 1.53×, so ~1.19× is the honest whole-model
+  number to carry (the earlier 1.09× was the weakly-typed engine before this lever).
+
 ## What's next (not done)
-- **The real target: the KV-cache `global_blocks`** (dynamic control flow). Stage 4
-  proves the frame blocks aren't where the time goes; the `global_blocks` + heads are.
-  That's the genuinely difficult export (stateful, data-dependent) and the only path to
-  a meaningful whole-model speedup.
+- **Per-block lever done (1.21× → 1.53× via strongly-typed fp16).** Remaining upside: INT8
+  (calibration npz already dumped by the exporter → `--calib-npz`, though the block is
+  attention/softmax-bound so expect ≤10–20%); the KV-cache-engine idea.
+- **Integrate all 24 blocks** (`integrate_e2e.py` pattern) + whole-model fps vs the bf16
+  baseline with the NaN-aware parity harness — only worth it once the per-block gain and
+  the dynamic-cache-length engine (currently static at 9 frames) are settled.
+- **Caveat to carry:** the static engine bakes the cache conditionals for one length
+  (two `TracerWarning`s on the skip-append branch); a streaming engine needs the
+  `--dynamic-cache` axis + an optimization profile over cache history.
 
 ## Methodology (Stage 4, end-to-end)
 - **TRT I/O:** torch CUDA tensors as engine buffers via `set_tensor_address` +
