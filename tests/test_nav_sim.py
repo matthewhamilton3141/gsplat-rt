@@ -323,6 +323,24 @@ def test_occupancy_grid_marks_out_of_bounds_as_occupied():
     assert grid.sum() > 0, "cells past the nearby walls should be marked occupied"
 
 
+def test_randomize_obstacles_varies_scene_and_keeps_start_goal_clear():
+    cfg = NavSimConfig(bounds=(-5.0, -5.0, 5.0, 5.0), randomize_obstacles=6,
+                       randomize_clearance=0.5)
+    env = DiffDriveNavEnv(cfg)
+    env.reset(seed=1)
+    field1 = env._obstacles.copy()
+    start1, goal1 = env.robot_xy.copy(), env._goal.copy()
+    assert 0 < len(field1) <= 6
+    # start & goal must not be inside any obstacle, and the start must be collision-free.
+    for cx, cy, r in field1:
+        assert np.hypot(cx - start1[0], cy - start1[1]) > r
+        assert np.hypot(cx - goal1[0], cy - goal1[1]) > r
+    assert not env._collides(env.robot_xy)
+    # a different seed gives a different field (fresh scene per episode).
+    env.reset(seed=2)
+    assert not np.array_equal(field1, env._obstacles)
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

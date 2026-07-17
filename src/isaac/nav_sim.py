@@ -92,6 +92,14 @@ class NavSimConfig:
     occupancy_size: int = 0            # 0 disables; else N -> N*N cells appended to the obs
     occupancy_extent: float = 4.0      # side length (m) of the square the grid covers
 
+    # --- optional per-episode randomization (RL training / eval variety) ---
+    # If randomize_obstacles > 0, each reset() regenerates that many obstacles via
+    # `random_obstacle_field` (with the sampled start & goal kept clear), overriding
+    # `obstacles`. Gives the agent a fresh scene every episode without a new env.
+    randomize_obstacles: int = 0
+    randomize_radius: tuple[float, float] = (0.3, 0.6)
+    randomize_clearance: float = 0.5
+
     def obstacle_array(self) -> np.ndarray:
         """Obstacles as a contiguous (N, 3) float array (empty (0, 3) if none)."""
         if self.obstacles is None:
@@ -246,6 +254,11 @@ class DiffDriveNavEnv:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
+        # With randomization on, clear the field first so start/goal sample freely; the fresh
+        # obstacles are generated afterwards with those points kept clear.
+        if self.cfg.randomize_obstacles > 0:
+            self._obstacles = np.zeros((0, 3), float)
+
         if self.cfg.fixed_goal is not None:
             self._goal = np.asarray(self.cfg.fixed_goal, float)
         else:
@@ -260,6 +273,14 @@ class DiffDriveNavEnv:
                     break
             self._x, self._y = float(start[0]), float(start[1])
             self._heading = float(self._rng.uniform(-np.pi, np.pi))
+
+        # Generate a fresh obstacle field for this episode, keeping start & goal clear.
+        if self.cfg.randomize_obstacles > 0:
+            self._obstacles = random_obstacle_field(
+                self.cfg.randomize_obstacles, self.cfg.bounds,
+                radius_range=self.cfg.randomize_radius, clearance=self.cfg.randomize_clearance,
+                keep_clear=(self.robot_xy, self._goal),
+                seed=int(self._rng.integers(2 ** 31)))
 
         self._lin_vel = self._ang_vel = 0.0
         self._prev_dist = distance_to_goal(self.robot_xy, self._goal)
