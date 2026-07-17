@@ -95,6 +95,18 @@ def _describe(v, torch):
     return type(v).__name__
 
 
+def _to_numpy(t, torch):
+    """numpy() cast that survives dtypes numpy can't hold natively.
+
+    The v-cache is bfloat16 (no numpy equivalent) -> up-cast to float32 first, which is
+    what we compare against for parity anyway. complex128 (RoPE `pos`) numpy handles fine.
+    """
+    t = t.detach().cpu()
+    if t.dtype == torch.bfloat16:
+        t = t.float()
+    return t.numpy()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stage 5 Step 2: export one global_block")
     ap.add_argument("--model_path", required=True)
@@ -222,11 +234,11 @@ def main() -> int:
         dump = {}
         for i, (k, v) in enumerate(_iter_call(cap, torch)):
             if torch.is_tensor(v):
-                dump[f"in__{_slot_name(i, k)}"] = v.detach().cpu().numpy()
+                dump[f"in__{_slot_name(i, k)}"] = _to_numpy(v, torch)
         for i, t in enumerate(out_flat):
-            dump[f"out__{i}"] = t.detach().cpu().numpy()
+            dump[f"out__{i}"] = _to_numpy(t, torch)
         for name in changed:
-            dump[f"newcache__{name}"] = cap["cache_after"][name][2].numpy()
+            dump[f"newcache__{name}"] = _to_numpy(cap["cache_after"][name][2], torch)
         np.savez(args.dump_io, **dump)
         print(f"\ndumped captured I/O -> {args.dump_io} ({len(dump)} arrays)")
 
