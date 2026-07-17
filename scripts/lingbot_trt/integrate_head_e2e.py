@@ -36,6 +36,9 @@ def _capture_head(model, head, imgs, args, torch):
     def pre(m, a, kw):
         if "in" not in cap:
             cap["in"] = (a, kw)
+        a0 = a[0]
+        feats = list(a0) if isinstance(a0, (list, tuple)) else [a0]
+        cap.setdefault("s_seen", []).append(int(feats[0].shape[1]))   # frame count per call
 
     def post(m, a, kw, out):
         if "out" not in cap:
@@ -78,15 +81,22 @@ def _export_head_onnx(head, cap, onnx_path, opset, torch):
         ref = wrapper(*ex)
     in_names = [f"feat{i}" for i in range(n_feat)] + list(kw_order)
     out_names = [f"out{i}" for i in range(len(ref))]
-    print(f"exporting head ONNX ({len(ref)} outputs {[tuple(t.shape) for t in ref]}) ...")
+    # Frame count (dim 1) varies across head calls (chunks / scale pass / partial windows);
+    # mark it dynamic on every I/O so one engine covers them (and images can't fold away).
+    dyn_axes = {n: {1: "S"} for n in in_names + out_names}
+    print(f"exporting head ONNX ({len(ref)} outputs {[tuple(t.shape) for t in ref]}, "
+          f"dynamic frame axis) ...")
     torch.onnx.export(wrapper, ex, onnx_path, input_names=in_names, output_names=out_names,
-                      opset_version=opset, do_constant_folding=True, dynamo=False)
+                      opset_version=opset, do_constant_folding=True, dynamo=False,
+                      dynamic_axes=dyn_axes)
     return in_names, out_names, n_feat, kw_order, const_kw, ex
 
 
-def _make_trt_head(orig, engine_bytes, in_names, out_names, out_template, trt, logger, torch):
-    """nn.Module replacing the head: runs the fixed-shape engine when the call matches, else
-    falls back to the torch head. Weakly-typed fp16 has fp32 I/O so no casting is needed."""
+def _make_trt_head(orig, engine_bytes, in_names, out_names, out_template, max_s,
+                   trt, logger, torch):
+    """nn.Module replacing the head: runs the engine when the call fits the profile (all dims
+    match except the dynamic frame axis, dim 1, which must be ≤ max_s), else falls back to the
+    torch head. Weakly-typed fp16 has fp32 I/O so no casting is needed."""
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(engine_bytes)
     context = engine.create_execution_context()
@@ -123,8 +133,23 @@ def _make_trt_head(orig, engine_bytes, in_names, out_names, out_template, trt, l
             # assemble inputs in the exported name order
             named = {f"feat{i}": f for i, f in enumerate(feats)}
             named.update(tkw)
-            if any(n not in named or tuple(named[n].shape) != exp_shapes[n] for n in engine_in):
-                self.n_fallback += 1                     # off-shape (e.g. short final chunk)
+
+            def _fits(name):
+                if name not in named:
+                    return False
+                actual, exp = tuple(named[name].shape), exp_shapes[name]
+                if len(actual) != len(exp):
+                    return False
+                for d, (av, ev) in enumerate(zip(actual, exp)):
+                    if d == 1:                            # dynamic frame axis
+                        if av < 1 or av > max_s:
+                            return False
+                    elif av != ev:
+                        return False
+                return True
+
+            if not all(_fits(n) for n in engine_in):
+                self.n_fallback += 1                      # off-profile shape
                 return self.orig(*args, **kwargs)
 
             held = []
@@ -198,11 +223,22 @@ def main() -> int:
     print(f"head call: {len(feats)} feats {[tuple(t.shape) for t in feats]} + "
           f"{ {k: tuple(v.shape) for k, v in kw.items() if torch.is_tensor(v)} }")
 
-    # --- export fp32 ONNX + build weakly-typed fp16 engine ---
-    onnx_path = os.path.join(args.engine_dir, f"{args.head}.fp32.onnx")
-    eng_path = os.path.join(args.engine_dir, f"{args.head}.fp16w.engine")
+    s_seen = cap.get("s_seen", [feats[0].shape[1]])
+    s_min, s_max = min(s_seen), max(s_seen)
+    print(f"head frame-count (S) across calls: {s_min}..{s_max} over {len(s_seen)} calls")
+
+    # --- export fp32 ONNX (dynamic frame axis) + build weakly-typed fp16 engine w/ profile ---
+    onnx_path = os.path.join(args.engine_dir, f"{args.head}.fp32.dyn.onnx")
+    eng_path = os.path.join(args.engine_dir, f"{args.head}.fp16w.dyn.engine")
     in_names, out_names, n_feat, kw_order, const_kw, ex = _export_head_onnx(
         head, cap, onnx_path, args.opset, torch)
+    # one optimization profile covering the frame-axis range (dim 1) of every input
+    profiles = {}
+    for i, name in enumerate(in_names):
+        shp = list(ex[i].shape)
+        profiles[name] = (tuple([shp[0], s_min] + shp[2:]),
+                          tuple([shp[0], s_max] + shp[2:]),
+                          tuple([shp[0], s_max] + shp[2:]))
     if os.path.exists(eng_path):
         with open(eng_path, "rb") as f:
             engine_bytes = f.read()
@@ -210,13 +246,13 @@ def main() -> int:
     else:
         engine_bytes = build_engine(onnx_path, fp16=True, bf16=False, strongly_typed=False,
                                     int8=False, calibrator=None, workspace_gb=args.workspace_gb,
-                                    logger=logger, trt=trt)
+                                    logger=logger, trt=trt, dynamic_profiles=profiles)
         with open(eng_path, "wb") as f:
             f.write(engine_bytes)
         print(f"engine saved -> {eng_path}")
 
     trt_head = _make_trt_head(head, engine_bytes, in_names, out_names, cap["out"],
-                              trt, logger, torch)
+                              s_max, trt, logger, torch)
 
     # --- per-head self-check on the REAL captured input (the parity verification) ---
     print("\n== per-head self-check: TRT fp16 engine vs torch fp32 head (captured input) ==")
