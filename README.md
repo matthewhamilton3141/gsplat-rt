@@ -133,6 +133,7 @@ A separate, measurement-driven study taking a **VGGT-style streaming reconstruct
 
 - **Profiled first.** A CUDA-event runtime split found the KV-cache `global_blocks` (45%) + DPT/camera heads (17.5%) dominate — *not* the frame blocks. This is why the initial Stage-4 experiment (all 24 frame blocks → TRT) only moved the whole model ~1.08×: the per-block 1.76× fusion win doesn't translate when you optimize the wrong thing.
 - **Then optimized the real bottlenecks, per component → measured whole-model:** the stateful `global_blocks` (complex-RoPE + growing KV cache) at **1.53× per block → 1.069× whole-model**, and the static **DPT head at 2.93× per head → 1.098× whole-model** (parity-verified, 0 NaN). Notably the *smaller* head chunk won *more* end-to-end — because static work translates cleanly where the dynamic-cache blocks pay integration overhead.
+- **Stacked both levers → 1.187× whole-model** (7.69 → 9.13 fps, parity 3.23%, 0 NaN). Because the two targets are *disjoint* runtime slices (45% + 17.5% = 62.7% now in TensorRT), their savings **compound** — the combined number beats either alone, the mirror image of the per-block dilution above.
 - Getting correct numbers took real engineering: dynamic optimization profiles (batch *and* cache-length), current-stream execution (fixing a precision-independent NaN race), a real-valued RoPE refactor to escape complex-dtype ONNX, and engine-authoritative I/O binding.
 
 See [`scripts/lingbot_trt/RESULTS.md`](scripts/lingbot_trt/RESULTS.md).
