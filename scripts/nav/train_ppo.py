@@ -28,6 +28,7 @@ def make_cfg(args) -> NavSimConfig:
         n_lidar_beams=args.beams,
         occupancy_size=args.occupancy,
         randomize_obstacles=args.obstacles,
+        use_safety_shield=args.shield,
         task=NavTaskConfig(
             max_steps=args.max_steps,
             collision_penalty=args.collision_penalty,
@@ -82,6 +83,8 @@ def main() -> int:
                     help="clearance (m) at/below which the dense proximity penalty ramps in")
     ap.add_argument("--clearance-penalty", type=float, default=0.0,
                     help="peak dense proximity penalty at contact (0 = off, the old reward)")
+    ap.add_argument("--shield", action="store_true",
+                    help="train (and eval) through the hard safety shield (shield-in-the-loop)")
     ap.add_argument("--eval-episodes", type=int, default=200)
     ap.add_argument("--out", default="/tmp/nav_ppo")
     ap.add_argument("--seed", type=int, default=0)
