@@ -75,10 +75,15 @@ def main() -> int:
     ap.add_argument("--radius", type=float, default=0.1, help="sphere radius (m)")
     ap.add_argument("--settle-speed", type=float, default=0.05,
                     help="max speed (m/s) to count as 'at rest'")
-    ap.add_argument("--skip-validate", action="store_true")
+    ap.add_argument("--skip-validate", action="store_true",
+                    help="skip the pxr CPU pre-flight (needed inside the Isaac venv, whose USD is "
+                         "provided only through the Kit runtime — validate on any pxr box first)")
+    ap.add_argument("--up-axis", choices=["X", "Y", "Z"], default=None,
+                    help="stage up-axis to test along when --skip-validate (default Z); pass the "
+                         "axis reported by usd_isaac_check (this project exports Y-up)")
     args = ap.parse_args()
 
-    up_axis = "Z" if args.skip_validate else _preflight(args.usdz)
+    up_axis = (args.up_axis or "Z").upper() if args.skip_validate else _preflight(args.usdz)
     if up_axis != "Z":
         print(f"NOTE: stage is {up_axis}-up, not Isaac's Z-up. Testing the collider along "
               f"its own up-axis; Isaac Lab (Z-up) will need the stage re-oriented first.")
