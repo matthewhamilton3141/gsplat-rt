@@ -29,12 +29,56 @@ Training reward plateaued at `ep_rew_mean ≈ 14`.
   detours.
 - **The honest cost is a bit of safety:** 4 collisions (2%) vs the heuristic's 0. The classic
   speed↔safety tradeoff — PPO exploits the dense progress reward toward faster paths and clips an
-  obstacle occasionally. A heavier `collision_penalty` (currently 5.0) or a safety margin in the
-  reward would trade some of that speed back; a clean next experiment.
+  obstacle occasionally. The reward-shaping sweep below chased this.
+
+## Reward-shaping sweep — push collisions → 0 (measured, A10G)
+The sparse `collision_penalty` only fires *on* the hit, giving the policy no gradient to stay
+clear. So I added an optional **dense clearance penalty** (`nav_task.clearance_penalty`) that
+ramps up as the robot's clearance to the nearest obstacle/wall falls below `clearance_margin`,
+peaking at contact — a gradient to avoid *before* colliding. `scripts/nav/sweep_reward.py` trains
+a 5-config grid (sparse ± dense shaping) and evaluates each on one **identical** held-out scene
+set. To keep the sweep cheap it trains each config at a reduced **500k** steps (⅓ of the flagship
+budget), so read the sweep as a *relative* comparison, then the winner was retrained at the full
+1.5M.
+
+| config | reward shape | reached | collided | mean steps |
+|---|---|---|---|---|
+| baseline | cp=5, no clearance | 78% | 44 | 48 |
+| cp10 | cp=10 (sparse only) | 68% | 64 | 44 |
+| clear_soft | cp=5 + dense 0.5, margin 0.30 | 68% | 64 | 44 |
+| **clear_firm** | cp=10 + dense 1.0, margin 0.40 | **94%** | **10** | 59 |
+| clear_wide | cp=8 + dense 1.0, margin 0.50 | 88% | 14 | 78 |
+| *avoidance (ref)* | hand-written gap-follower | 96% | 0 | 99 |
+
+*(500k-step budget; the baseline is undertrained vs the 1.5M flagship — hence 78%, not 98%.)*
+
+**Reading it honestly — two findings, both measured:**
+- **At a reduced budget, the dense shaping is a large sample-efficiency win.** `clear_firm` cut
+  collisions **44 → 10 (−77%)** *and* raised reached **78% → 94%** vs the same-budget baseline.
+  Notably, bumping the *sparse* penalty alone (`cp10`) or a *gentle* dense penalty (`clear_soft`)
+  **did not help** (both 68% / 64 collisions) — it's specifically the firm dense keep-clear
+  gradient that works, and over-widening the margin (`clear_wide`) traded speed for nothing.
+- **At the full 1.5M budget the effect largely washes out.** Retraining `clear_firm` at 1.5M:
+  **98% reached, 3 collisions, 58 steps** — vs the un-shaped flagship's **98% / 4 / 58**. So the
+  shaping barely moved final collisions (**4 → 3**); the un-shaped policy simply *converges* to the
+  same speed/safety frontier given enough samples. **The dense clearance penalty is a
+  convergence-speed lever, not a path to zero collisions.**
+
+| policy (1.5M steps) | reached | collided | mean steps |
+|---|---|---|---|
+| flagship (no shaping) | 98% | 4 | 58 |
+| **clear_firm (dense clearance)** | **98%** | **3** | **58** |
+
+**The honest conclusion:** reward shaping alone doesn't break the speed↔safety frontier here — PPO
+at 98%/58-steps sits at ~1.5–2% collisions, while the only 0-collision policy (the heuristic) pays
+~70% more steps (99 vs 58). Reaching *exactly* 0 without surrendering the speed win likely needs a
+**hard safety layer** (action masking / a shielded controller near obstacles) rather than a softer
+reward — a bigger change than shaping. Saved policies: `~/nav_ppo_sweep/<config>/` +
+`~/nav_ppo_clearfirm/` on the box; sweep summary `~/nav_ppo_sweep/sweep_results.json`.
 
 ## Next
-- Reward-shaping sweep (collision penalty / safety margin) to push collisions → 0 without losing
-  the speed win; add the **egocentric occupancy grid** to the obs (already in the env) and measure
-  whether the richer map helps in denser fields.
-- Curriculum over `randomize_obstacles` count. Port the trained policy onto a PyBullet rigid-body
-  backend, then the Isaac Lab adapter (`isaac_nav_env.py`, same env contract).
+- **Hard safety shield** (clip actions that would enter an obstacle's margin) — the frontier-
+  breaking change the reward sweep showed shaping can't deliver.
+- Add the **egocentric occupancy grid** to the obs (already in the env) for denser fields;
+  curriculum over `randomize_obstacles`. Port onto a PyBullet rigid-body backend, then the Isaac
+  Lab adapter (`isaac_nav_env.py`, same env contract).
