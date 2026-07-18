@@ -143,9 +143,34 @@ still crush it at 100% / 0 / ~57, ~2× faster than the heuristic.) Where occupan
 its keep: still-denser or non-convex clutter where beams miss what a top-down map captures — the
 natural follow-up.
 
+## Make it physical — PyBullet rigid-body backend + sim-to-sim transfer (measured, A10G)
+The whole nav flagship so far runs in `DiffDriveNavEnv`, an analytic unicycle: motion is exact
+integration and a "collision" is a geometric overlap. The real test of a sim-trained policy is
+whether it survives *physics*. `nav_pybullet.PyBulletNavEnv` swaps in a **real rigid-body cylinder
+in PyBullet** — mass, friction, contact-resolved collisions — while reusing the tested core for
+everything else (an internal `DiffDriveNavEnv` samples the scene so a seed yields the *identical*
+field, and supplies the observation + `nav_task` reward/termination; PyBullet owns only how the
+robot moves and collides). 6 conformance tests pass on the box (contract, same-seed scene match,
+physics motion, contact-based collision, shielded-heuristic reach, shield-prevents-collision).
+
+Then the payoff — `eval_pybullet.py` runs the **kinematic-trained** shield-in-the-loop policy in
+*both* worlds on identical held-out scenes (both shielded):
+
+| world (same policy, 100 held-out scenes, shielded) | reached | collided | mean steps |
+|---|---|---|---|
+| kinematic (where it trained) | 100% | 0 | 57 |
+| **PyBullet (rigid-body physics)** | **99%** | **0** | 63 |
+
+**The policy transfers cleanly to physics with no retraining:** reached 100% → 99% (a single
+episode), **0 collisions preserved** (the shield's safety guarantee holds under real contacts, not
+just analytic ones), and mean steps 57 → 63 (~10% slower — the honest cost of friction and
+contact dynamics the kinematic sim idealizes away). A small, well-characterized sim-to-sim gap is
+exactly what you want to see before a hardware or Isaac Lab port: the learned behavior is not an
+artifact of the kinematic idealization.
+
 ## Next
-- **Occupancy in harder clutter** — push obstacle count / add non-convex arrangements where lidar
-  beams miss structure the top-down map catches; that's where the occupancy grid should start to
-  pay off (it didn't need to at 8 obstacles).
-- **PyBullet rigid-body backend** then the Isaac Lab adapter (`isaac_nav_env.py`, same tested
-  contract) — the "make it physical" step; a larger, interactive effort.
+- **Isaac Lab port** — `isaac_nav_env.py` already targets the same tested contract; the PyBullet
+  result de-risks it (the policy survives real physics). Needs the Isaac stack (`isaac_setup.sh`,
+  `phase0_smoke.py`, and the Y-up→Z-up resolution) — see the M7 groundwork notes.
+- **Occupancy in harder clutter** — non-convex arrangements where lidar beams miss what a top-down
+  map catches (it didn't help at 8 convex obstacles).
