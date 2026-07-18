@@ -100,6 +100,43 @@ def test_collision_terminates_with_penalty():
     assert info["robot_xy"][0] < 1.0 - 0.4
 
 
+def test_clearance_geometry():
+    # One obstacle (centre (1,0), r=0.4); robot radius 0.18. From the origin the nearest
+    # obstacle edge is at x=0.6, so disc-edge clearance = 0.6 - 0.18 = 0.42.
+    cfg = _open_field(obstacles=np.array([[1.0, 0.0, 0.4]]), robot_radius=0.18,
+                      bounds=(-5.0, -5.0, 5.0, 5.0))
+    env = DiffDriveNavEnv(cfg)
+    env.reset(seed=0)
+    assert abs(env._clearance(np.array([0.0, 0.0])) - 0.42) < 1e-9
+    # Right up against the surface -> ~0 clearance; touching -> non-positive.
+    assert abs(env._clearance(np.array([0.42, 0.0]))) < 1e-9
+    # Walls also count: near a bound, clearance is bound-limited.
+    near_wall = _open_field(bounds=(-1.0, -1.0, 1.0, 1.0), robot_radius=0.18)
+    e2 = DiffDriveNavEnv(near_wall)
+    e2.reset(seed=0)
+    assert abs(e2._clearance(np.array([0.9, 0.0])) - (0.1 - 0.18)) < 1e-9  # 0.9->wall 1.0
+
+
+def test_clearance_penalty_reduces_reward_near_obstacle():
+    # With the dense keep-clear penalty on, a step taken close to an obstacle earns strictly
+    # less than the same kinematics far from any obstacle (holding progress fixed).
+    task = NavTaskConfig(max_steps=300, time_penalty=0.0,
+                         clearance_margin=0.5, clearance_penalty=2.0)
+    near = _open_field(obstacles=np.array([[0.6, 0.0, 0.3]]), robot_radius=0.18, task=task)
+    env = DiffDriveNavEnv(near)
+    env.reset(seed=0)
+    _, r_near, _, _, info = env.step([0.0, 0.0])   # sit still inside the margin
+    # clearance here = (0.6-0.3) - 0.18 = 0.12 < margin 0.5 -> penalty applies
+    assert r_near < 0.0
+    # Same still step with the feature off is exactly zero reward (no progress, no time cost).
+    off = _open_field(obstacles=np.array([[0.6, 0.0, 0.3]]), robot_radius=0.18,
+                      task=NavTaskConfig(max_steps=300, time_penalty=0.0))
+    e_off = DiffDriveNavEnv(off)
+    e_off.reset(seed=0)
+    _, r_off, _, _, _ = e_off.step([0.0, 0.0])
+    assert abs(r_off) < 1e-9 and r_near < r_off
+
+
 def test_out_of_bounds_is_collision():
     cfg = _open_field(bounds=(-1.0, -1.0, 1.0, 1.0), fixed_goal=(0.5, 0.0),
                       task=NavTaskConfig(max_steps=300, goal_radius=0.05))
