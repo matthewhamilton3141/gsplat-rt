@@ -16,8 +16,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from isaac.nav_sim import (  # noqa: E402
-    DiffDriveNavEnv, NavSimConfig, avoidance_action, heuristic_action,
-    random_obstacle_field,
+    DiffDriveNavEnv, NavSimConfig, avoidance_action, clearance_at, heuristic_action,
+    predict_pose, random_obstacle_field, safety_shield,
 )
 from isaac.nav_task import (  # noqa: E402
     ACT_DIM, OBS_DIM, NavTaskConfig, reward as nav_reward,
@@ -135,6 +135,95 @@ def test_clearance_penalty_reduces_reward_near_obstacle():
     e_off.reset(seed=0)
     _, r_off, _, _, _ = e_off.step([0.0, 0.0])
     assert abs(r_off) < 1e-9 and r_near < r_off
+
+
+def test_predict_pose_matches_step_integration():
+    # The shield's lookahead must integrate exactly as step() does, or its safety guarantee
+    # is void. Drive one step and compare the sim's new position to predict_pose's.
+    env = DiffDriveNavEnv(_open_field())
+    env.reset(seed=0)
+    xy0, h0 = env.robot_xy.copy(), env._heading
+    lin, ang = 0.7, 0.5
+    predicted = predict_pose(xy0, h0, lin, ang, env.cfg.dt)
+    env.step([lin, ang])
+    assert np.allclose(env.robot_xy, predicted, atol=1e-9)
+
+
+def test_clearance_at_matches_method():
+    cfg = _open_field(obstacles=np.array([[1.0, 0.0, 0.4]]), robot_radius=0.18)
+    env = DiffDriveNavEnv(cfg)
+    env.reset(seed=0)
+    for xy in ([0.0, 0.0], [0.3, 0.1], [-2.0, 1.5]):
+        p = np.array(xy)
+        assert abs(clearance_at(p, env._obstacles, cfg.bounds, cfg.robot_radius)
+                   - env._clearance(p)) < 1e-12
+
+
+def test_safety_shield_passes_safe_action_unchanged():
+    # Open field, plenty of room -> the shield must not touch a safe forward command.
+    cfg = _open_field(bounds=(-5.0, -5.0, 5.0, 5.0))
+    out = safety_shield([1.0, 0.3], np.array([0.0, 0.0]), 0.0, np.zeros((0, 3)), cfg)
+    assert np.allclose(out, [1.0, 0.3], atol=1e-6)
+
+
+def test_safety_shield_reduces_forward_into_obstacle():
+    # Robot starts SAFE (clearance 0.07 > margin 0.05) but a full 0.1 m step forward would
+    # enter the margin -> shield throttles the forward speed (doesn't necessarily zero it) so
+    # the predicted pose stays outside the margin, and passes the angular command through.
+    cfg = _open_field(obstacles=np.array([[0.35, 0.0, 0.10]]), robot_radius=0.18,
+                      safety_margin=0.05)
+    obs = cfg.obstacle_array()
+    assert clearance_at(np.array([0.0, 0.0]), obs, cfg.bounds, cfg.robot_radius) > cfg.safety_margin
+    out = safety_shield([1.0, 0.8], np.array([0.0, 0.0]), 0.0, obs, cfg)
+    assert 0.0 <= out[0] < 1.0        # forward throttled below the commanded 1.0
+    assert abs(out[1] - 0.8) < 1e-6   # rotation passes through
+    nxt = predict_pose([0.0, 0.0], 0.0, out[0], out[1], cfg.dt)
+    assert clearance_at(nxt, obs, cfg.bounds, cfg.robot_radius) >= cfg.safety_margin - 1e-9
+
+
+def test_safety_shield_boxed_in_forbids_forward():
+    # Robot effectively enclosed (obstacle overlapping ahead) -> no safe forward fraction;
+    # shield forbids forward motion entirely and only lets it rotate (which cannot collide).
+    cfg = _open_field(obstacles=np.array([[0.25, 0.0, 0.20]]), robot_radius=0.18,
+                      safety_margin=0.05)
+    out = safety_shield([1.0, 0.8], np.array([0.0, 0.0]), 0.0, cfg.obstacle_array(), cfg)
+    assert out[0] == 0.0
+    assert abs(out[1] - 0.8) < 1e-6
+
+
+def test_safety_shield_never_enters_margin():
+    # Property test: over many random states/actions, the shielded action's predicted next
+    # pose keeps clearance >= margin whenever it advances (out[0] != 0).
+    rng = np.random.default_rng(0)
+    cfg = NavSimConfig(bounds=(-5.0, -5.0, 5.0, 5.0), robot_radius=0.18, safety_margin=0.05)
+    for _ in range(500):
+        obstacles = np.column_stack([rng.uniform(-4, 4, 4), rng.uniform(-4, 4, 4),
+                                     rng.uniform(0.3, 0.6, 4)])
+        xy = rng.uniform(-4, 4, 2)
+        if clearance_at(xy, obstacles, cfg.bounds, cfg.robot_radius) < cfg.safety_margin:
+            continue  # spawned already inside the margin; shield only guarantees not-worse
+        heading = rng.uniform(-np.pi, np.pi)
+        action = [rng.uniform(-1, 1), rng.uniform(-2, 2)]
+        out = safety_shield(action, xy, heading, obstacles, cfg)
+        nxt = predict_pose(xy, heading, out[0], out[1], cfg.dt)
+        assert clearance_at(nxt, obstacles, cfg.bounds, cfg.robot_radius) >= cfg.safety_margin - 1e-9
+
+
+def test_shield_prevents_collision_in_the_loop():
+    # The money test: a reckless "always full forward" policy driven THROUGH the shield must
+    # never collide, on a field of obstacles between start and goal.
+    obstacles = np.array([[1.0, 0.0, 0.4], [2.0, 0.3, 0.3], [1.5, -0.5, 0.35]])
+    cfg = _open_field(obstacles=obstacles, fixed_goal=(3.0, 0.0), robot_radius=0.18,
+                      safety_margin=0.05, task=NavTaskConfig(max_steps=300))
+    env = DiffDriveNavEnv(cfg)
+    env.reset(seed=0)
+    for _ in range(300):
+        raw = np.array([1.0, 0.5])   # reckless: full speed, always turning one way
+        safe = safety_shield(raw, env.robot_xy, env._heading, env._obstacles, cfg)
+        _, _, term, trunc, info = env.step(safe)
+        assert not info["collided"], "shield must prevent every collision"
+        if term or trunc:
+            break
 
 
 def test_out_of_bounds_is_collision():

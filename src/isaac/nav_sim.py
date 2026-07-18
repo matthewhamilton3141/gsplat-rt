@@ -65,6 +65,7 @@ class NavSimConfig:
     max_lin_vel: float = 1.0         # |linear velocity| clip (m/s)
     max_ang_vel: float = 2.0         # |angular velocity| clip (rad/s)
     robot_radius: float = 0.18       # robot disc radius for collision (m)
+    safety_margin: float = 0.05      # clearance (m) the optional `safety_shield` keeps free
 
     # --- world ---
     # Bounds as (x_min, y_min, x_max, y_max). The robot collides with these walls.
@@ -106,6 +107,56 @@ class NavSimConfig:
             return np.zeros((0, 3), float)
         arr = np.asarray(self.obstacles, float).reshape(-1, 3)
         return arr
+
+
+def predict_pose(robot_xy: np.ndarray, heading: float, lin: float, ang: float,
+                 dt: float) -> np.ndarray:
+    """Next (x, y) after applying (lin, ang) for `dt` — midpoint-heading unicycle step.
+
+    Shared by the sim's `step()` and the `safety_shield` so their one-step lookahead is
+    byte-identical (a shield that predicts differently than the sim integrates is unsound).
+    """
+    mid = heading + 0.5 * ang * dt
+    return np.asarray(robot_xy, float) + lin * dt * np.array([np.cos(mid), np.sin(mid)])
+
+
+def clearance_at(xy: np.ndarray, obstacles: np.ndarray,
+                 bounds: tuple[float, float, float, float], robot_radius: float) -> float:
+    """Signed distance (m) from the robot disc edge at `xy` to the nearest obstacle/wall edge.
+
+    Positive is free space ahead of contact, 0 at touch, negative under overlap. Pure geometry
+    (no env state) so both `DiffDriveNavEnv._clearance` and the `safety_shield` reuse it.
+    """
+    x_min, y_min, x_max, y_max = bounds
+    clear = min(xy[0] - x_min, x_max - xy[0], xy[1] - y_min, y_max - xy[1]) - robot_radius
+    if len(obstacles):
+        d = np.linalg.norm(obstacles[:, :2] - np.asarray(xy, float)[None, :], axis=1)
+        clear = min(clear, float(np.min(d - obstacles[:, 2])) - robot_radius)
+    return float(clear)
+
+
+def safety_shield(action: np.ndarray, robot_xy: np.ndarray, heading: float,
+                  obstacles: np.ndarray, cfg: "NavSimConfig") -> np.ndarray:
+    """Hard one-step-lookahead safety filter over a commanded (lin, ang) action.
+
+    Scales the commanded forward speed down to the largest fraction whose *predicted* next pose
+    keeps clearance ≥ `cfg.safety_margin`; if no forward speed is safe (the robot is boxed in),
+    forbids forward motion entirely and lets the robot rotate in place — which cannot collide,
+    since zero linear velocity leaves (x, y) unchanged. The angular command always passes
+    through. This is a runtime layer over *any* policy (learned or heuristic): it never needs
+    retraining, and — within the one-step integration — it cannot let the robot into an
+    obstacle. The analogue of a costmap/collision-checker shield on a real robot.
+    """
+    a = np.asarray(action, float).reshape(-1)
+    lin = float(np.clip(a[0], -cfg.max_lin_vel, cfg.max_lin_vel))
+    ang = float(np.clip(a[1], -cfg.max_ang_vel, cfg.max_ang_vel))
+    obs = np.asarray(obstacles, float).reshape(-1, 3) if obstacles is not None and len(obstacles) \
+        else np.zeros((0, 3), float)
+    for s in np.linspace(1.0, 0.0, 11):          # largest safe forward fraction wins
+        nxt = predict_pose(robot_xy, heading, s * lin, ang, cfg.dt)
+        if clearance_at(nxt, obs, cfg.bounds, cfg.robot_radius) >= cfg.safety_margin:
+            return np.array([s * lin, ang], np.float32)
+    return np.array([0.0, ang], np.float32)       # boxed in: rotate in place, never advance
 
 
 def _ray_min_distance(
@@ -191,15 +242,9 @@ class DiffDriveNavEnv:
 
         Positive is free space ahead of contact, 0 at touch (negative only under overlap,
         which `_collides` already flags). Feeds the optional dense proximity-penalty reward
-        shaping; mirrors `_collides`' geometry (bounds + circular obstacles).
+        shaping; delegates to the shared `clearance_at` geometry (bounds + circular obstacles).
         """
-        r = self.cfg.robot_radius
-        x_min, y_min, x_max, y_max = self.cfg.bounds
-        clear = min(xy[0] - x_min, x_max - xy[0], xy[1] - y_min, y_max - xy[1]) - r
-        if len(self._obstacles):
-            d = np.linalg.norm(self._obstacles[:, :2] - xy[None, :], axis=1)
-            clear = min(clear, float(np.min(d - self._obstacles[:, 2])) - r)
-        return float(clear)
+        return clearance_at(xy, self._obstacles, self.cfg.bounds, self.cfg.robot_radius)
 
     def _lidar(self) -> np.ndarray:
         """Normalised free-distance readings for the beam fan (empty if disabled)."""
@@ -311,8 +356,7 @@ class DiffDriveNavEnv:
         # Unicycle integration (midpoint heading keeps curved motion accurate at large dt).
         dt = self.cfg.dt
         new_heading = self._heading + ang * dt
-        mid = 0.5 * (self._heading + new_heading)
-        new_xy = self.robot_xy + lin * dt * np.array([np.cos(mid), np.sin(mid)])
+        new_xy = predict_pose(self.robot_xy, self._heading, lin, ang, dt)
 
         collided = self._collides(new_xy)
         if not collided:
