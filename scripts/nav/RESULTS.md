@@ -118,7 +118,34 @@ reward shaping (can't reach 0 — and we said so) → hard safety shield (0 cras
 **shield-in-the-loop (0 crashes *and* the fastest, most reliable policy of them all).** Every rung
 measured on the box, nothing assumed.
 
+## Does the occupancy map help? — lidar vs lidar+occupancy on a denser field (measured, A10G)
+Closing the loop between the two halves of the project: the reconstruction pipeline emits a
+top-down occupancy map (`*_occupancy.png`), and the nav env can feed an egocentric 8×8 slice of
+exactly that as an extra observation block. On a **denser 8-obstacle field** (vs the 5 above),
+`compare_obs.py` trains two shielded policies differing *only* in the observation and evaluates
+both on one identical held-out set (collisions are 0 by construction, so this isolates reached% /
+efficiency):
+
+| observation (8-obstacle field, shielded) | reached | collided | mean steps |
+|---|---|---|---|
+| heuristic (`avoidance`) | 92% | 0 | 126 |
+| lidar (7 goal + 16 lidar) | 100% | 0 | 59 |
+| **lidar + 8×8 occupancy grid** | **100%** | 0 | **56** |
+
+**Honest finding: the occupancy grid barely helps here — it's a marginal efficiency refinement,
+not a categorical win.** Both learned policies already saturate the task (100% reached, 0
+collisions via the shield); adding the 64-cell occupancy map only trims mean steps 59 → 56 (~5%)
+and closes the last episode (199 → 200). The 16-beam lidar already carries enough local structure
+for an 8-obstacle field, so the richer map is largely redundant *at this density* — a result worth
+stating plainly rather than dressing up. (Two things that *did* hold: the denser field is genuinely
+harder — the hand-written heuristic drops to 92% / 126 steps — and the shielded learned policies
+still crush it at 100% / 0 / ~57, ~2× faster than the heuristic.) Where occupancy would likely earn
+its keep: still-denser or non-convex clutter where beams miss what a top-down map captures — the
+natural follow-up.
+
 ## Next
-- Add the **egocentric occupancy grid** to the obs (already in the env) for denser fields;
-  curriculum over `randomize_obstacles`. Port onto a PyBullet rigid-body backend, then the Isaac
-  Lab adapter (`isaac_nav_env.py`, same env contract).
+- **Occupancy in harder clutter** — push obstacle count / add non-convex arrangements where lidar
+  beams miss structure the top-down map catches; that's where the occupancy grid should start to
+  pay off (it didn't need to at 8 obstacles).
+- **PyBullet rigid-body backend** then the Isaac Lab adapter (`isaac_nav_env.py`, same tested
+  contract) — the "make it physical" step; a larger, interactive effort.
