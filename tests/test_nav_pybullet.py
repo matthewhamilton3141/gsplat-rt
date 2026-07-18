@@ -89,22 +89,43 @@ def test_collision_is_detected_by_contacts():
         env.close()
 
 
-def test_heuristic_plus_shield_navigates_in_physics():
-    # The go-to-goal heuristic wrapped in the safety shield should reach the goal in the rigid-body
-    # sim with zero collisions — proving the backend is solvable and the shield transfers.
-    cfg = _open_field(obstacles=np.array([[1.5, 0.2, 0.3]]), n_lidar_beams=16,
-                      fixed_goal=(3.0, 0.0), task=NavTaskConfig(max_steps=400))
+def test_shielded_heuristic_reaches_on_open_field():
+    # On an open field the go-to-goal heuristic (shielded) should reach the goal in the rigid-body
+    # sim — proving the physics backend is navigable end to end and the shield doesn't block a
+    # clear path. (Going *around* an obstacle in the robot's path is the learned policy's job, not
+    # this non-avoider heuristic's — with an obstacle dead ahead the shield correctly stops it and
+    # the heuristic, having no avoidance, would just deadlock. See the transfer eval for that.)
+    cfg = _open_field(n_lidar_beams=16, fixed_goal=(3.0, 0.0),
+                      task=NavTaskConfig(max_steps=400))
     env = PyBulletNavEnv(cfg)
     try:
         obs, _ = env.reset(seed=0)
         reached = collided = False
         for _ in range(400):
-            act = shielded_action(env, heuristic_action(obs, cfg))
-            obs, r, term, trunc, info = env.step(act)
+            obs, r, term, trunc, info = env.step(shielded_action(env, heuristic_action(obs, cfg)))
             collided = collided or info["collided"]
             if term or trunc:
                 reached = info["reached"]
                 break
-        assert reached and not collided, "shielded heuristic should reach the goal without collision"
+        assert reached and not collided, "shielded heuristic should reach the goal on an open field"
+    finally:
+        env.close()
+
+
+def test_shield_prevents_collision_in_physics():
+    # The safety guarantee must survive real contacts: a reckless full-forward policy driven
+    # through the shield into an obstacle dead ahead must never register a physics collision (it
+    # may deadlock at the margin — that's fine; the invariant is *no contact*).
+    cfg = _open_field(obstacles=np.array([[1.2, 0.0, 0.4]]), n_lidar_beams=16,
+                      fixed_goal=(3.0, 0.0), task=NavTaskConfig(max_steps=250))
+    env = PyBulletNavEnv(cfg)
+    try:
+        obs, _ = env.reset(seed=0)
+        for _ in range(250):
+            act = shielded_action(env, np.array([1.0, 0.4]))   # reckless: full speed ahead
+            obs, r, term, trunc, info = env.step(act)
+            assert not info["collided"], "shield must prevent every physics collision"
+            if term or trunc:
+                break
     finally:
         env.close()
