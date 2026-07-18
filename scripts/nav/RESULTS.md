@@ -88,18 +88,37 @@ rolls the **already-trained flagship policy** raw vs shielded on the same 200 he
 | **PPO + safety shield** | **95%** | **0** | 79 |
 | `avoidance` (hand-written) | 96% | 0 | 99 |
 
-**It works — collisions 4 → 0**, the thing reward shaping couldn't do (4 → 3). The cost is modest
-and honest: reached 98% → 95% (a handful of episodes the shield keeps too cautious to finish in
-budget) and steps 58 → 79 (+36%, the shield throttling near obstacles). **And the shielded learned
-policy now Pareto-dominates the hand-written safe baseline**: same safety (0 collisions), *fewer*
-steps (79 vs 99), comparable success (95% vs 96%) — a learned policy made provably safe that still
-beats the heuristic on efficiency. First validated off-box on a reckless go-to-goal controller
-(53 → 0 collisions on 200 random scenes) before spending any GPU time.
+**It works — collisions 4 → 0**, the thing reward shaping couldn't do (4 → 3). Wrapping the policy
+only at eval time costs a little (reached 98% → 95%, steps 58 → 79) because the policy never trained
+with the shield. First validated off-box on a reckless go-to-goal controller (53 → 0 collisions on
+200 random scenes) before spending any GPU time.
+
+## Shield-in-the-loop — train *through* the shield (measured, A10G): the capstone
+`train_ppo --shield` applies the shield at the RL boundary (`NavGymEnv.step`, pure core untouched)
+so the policy trains **through** the filter and adapts to it — it can commit to aggressive, direct
+paths knowing the shield guarantees it can't collide. Retrained at the full 1.5M budget, evaluated
+through the shield (its deployment configuration):
+
+| policy (1.5M, 200 held-out scenes) | reached | collided | mean steps |
+|---|---|---|---|
+| heuristic (`avoidance`) — safe but slow | 96% | 0 | 99 |
+| PPO raw — fast but unsafe | 98% | 4 | 58 |
+| `clear_firm` (reward shaping) — couldn't fix it | 98% | 3 | 58 |
+| PPO + shield (eval-time wrap) — safe, small cost | 95% | 0 | 79 |
+| **PPO shield-in-the-loop — safe *and* best** | **100%** | **0** | **56** |
+
+**Training through the shield doesn't just recover the eval-time cost — it dominates the raw
+flagship on every axis: 100% reached (vs 98%), 0 collisions (vs 4), 56 steps (vs 58).** The policy
+learns to *rely* on the shield: freed from having to be cautious itself, it takes the most direct
+routes and lets the filter handle the rare near-miss — provably safe (0 collisions, guaranteed by
+the shield) yet faster and more reliable than the unshielded policy that occasionally crashed.
+
+**The nav arc, end to end:** hand-written heuristic (safe, slow) → learned PPO (fast, 2% crashes) →
+reward shaping (can't reach 0 — and we said so) → hard safety shield (0 crashes, provably) →
+**shield-in-the-loop (0 crashes *and* the fastest, most reliable policy of them all).** Every rung
+measured on the box, nothing assumed.
 
 ## Next
-- **Shield-in-the-loop retrain** (optional) — train PPO *through* the shield so the policy adapts
-  to it, likely recovering the 3-pt reached / some of the step cost (the shield changes the
-  effective dynamics). The eval-time wrap already gives a clean win, so this is polish.
 - Add the **egocentric occupancy grid** to the obs (already in the env) for denser fields;
   curriculum over `randomize_obstacles`. Port onto a PyBullet rigid-body backend, then the Isaac
   Lab adapter (`isaac_nav_env.py`, same env contract).
