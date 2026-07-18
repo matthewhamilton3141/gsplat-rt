@@ -66,6 +66,7 @@ class NavSimConfig:
     max_ang_vel: float = 2.0         # |angular velocity| clip (rad/s)
     robot_radius: float = 0.18       # robot disc radius for collision (m)
     safety_margin: float = 0.05      # clearance (m) the optional `safety_shield` keeps free
+    use_safety_shield: bool = False  # if set, the RL adapter filters actions through the shield
 
     # --- world ---
     # Bounds as (x_min, y_min, x_max, y_max). The robot collides with these walls.

@@ -25,7 +25,7 @@ except ImportError as e:                                # pragma: no cover - box
         "nav_sim runs without it."
     ) from e
 
-from .nav_sim import DiffDriveNavEnv, NavSimConfig
+from .nav_sim import DiffDriveNavEnv, NavSimConfig, safety_shield
 
 
 class NavGymEnv(gym.Env):
@@ -50,5 +50,13 @@ class NavGymEnv(gym.Env):
         return np.asarray(obs, np.float32), info
 
     def step(self, action):
-        obs, reward, terminated, truncated, info = self.sim.step(np.asarray(action, np.float32))
+        # Optional shield-in-the-loop: filter the commanded action through the safety shield
+        # *before* stepping, so a policy trained with `use_safety_shield` learns through the
+        # shielded dynamics (and adapts to it) rather than only being wrapped at eval time.
+        # Applied here at the RL boundary so the pure-NumPy `nav_sim` core stays untouched.
+        action = np.asarray(action, np.float32)
+        if self.sim.cfg.use_safety_shield:
+            action = safety_shield(action, self.sim.robot_xy, self.sim._heading,
+                                   self.sim._obstacles, self.sim.cfg)
+        obs, reward, terminated, truncated, info = self.sim.step(action)
         return np.asarray(obs, np.float32), float(reward), bool(terminated), bool(truncated), info
