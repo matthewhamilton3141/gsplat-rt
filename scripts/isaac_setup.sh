@@ -6,20 +6,24 @@
 # Launcher, no display) into its OWN venv, then Isaac Lab on top, and runs a headless
 # smoke import so the box is proven before any real work.
 #
-# ── PARTIALLY VERIFIED (2026-07-18, A10G Brev box) ────────────────────────────────────
-# Isaac Sim 5.1.0 pip-installs and Kit BOOTS on the box (extensions load), BUT: the RTX
-# scene renderer (librtx.scenedb.plugin / libcarb.scenerenderer-rtx / libomni.hydra.rtx)
-# SEGFAULTS at startup on this bare headless A10G — even with a base experience and
-# {"renderer":"None"}. It's NOT OOM (13.5 GB free at crash) and NOT our scene (validated
-# 0-ERROR by usd_isaac_check). It's a missing/incompatible headless GRAPHICS runtime
-# (Vulkan/GL userspace) that pip Isaac doesn't bundle.
-#   → RECOMMENDED FIX for the next attempt: use NVIDIA's Isaac Sim **Docker container**
-#     (bundles the correct Vulkan/GL/driver userspace), or run under a virtual display
-#     (Xvfb) with the Vulkan ICD set up. A pip install on a bare box is the fragile path.
-#   → Also: this g5.xlarge has only 16 GB RAM (Isaac recommends 32 GB) — fine for the
-#     Phase-0 drop-test, but add a bigger box before RL training with many parallel envs.
-# The reconstruct→physics bridge is ALREADY proven via the PyBullet backend (nav_pybullet)
-# — Isaac is the eventual GPU-parallel/photoreal target, not a correctness gate.
+# ── BLOCKED on this box: DRIVER TOO NEW (root cause CONFIRMED 2026-07-18) ──────────────
+# Isaac Sim 5.1.0 pip-installs AND its NGC Docker image both run on this A10G box, Kit
+# boots and loads extensions — then the RTX scene renderer (librtx.scenedb.plugin /
+# libcarb.scenerenderer-rtx / libomni.hydra.rtx) SEGFAULTS at carbOnPluginStartup.
+#   ROOT CAUSE: this box's NVIDIA driver is **595.71.05 (the R590 branch)**, which is NOT
+#   validated for Isaac Sim 5.1.0 — a KNOWN NVIDIA incompatibility (Isaac GitHub #648/#651/
+#   #537, NVIDIA forums): the R590 driver branch crashes the Omniverse RTX renderer in
+#   exactly this plugin, across many GPUs. Isaac Sim 5.1.0's validated Linux driver is
+#   **580.65.06**. It is NOT our scene (0-ERROR by usd_isaac_check), NOT OOM (13.5 GB free),
+#   NOT missing userspace libs (the Docker image bundles them and STILL crashes — the driver
+#   comes from the HOST, so Docker can't fix a driver-level mismatch).
+#   → FIX: run on a box whose driver is ~580.x (ask Brev for a 580-era image, or a different
+#     instance), or wait for an Isaac Sim build validated against the R590/595 driver branch.
+#   → Also this g5.xlarge has 16 GB RAM (Isaac recommends 32 GB) — ok for Phase 0, size up
+#     before RL training with many parallel envs.
+# NOT a project blocker: the reconstruct→physics bridge is ALREADY proven via the PyBullet
+# backend (nav_pybullet, sim-to-sim 99%/0). Isaac is the eventual GPU-parallel/photoreal
+# target, gated purely on getting a driver-580 box — not on our code.
 #
 # VERIFIED requirements/steps (2026-07-18): driver 595.71 (>=580.65 ✓), Ubuntu 22.04,
 # Python 3.11 (Isaac 5.X needs 3.11 — get it via `uv python install 3.11`, no sudo), and
