@@ -131,11 +131,13 @@ The endpoint of the pipeline is a scene a robot can *act* in, so this milestone 
 - **Shield-in-the-loop** (train *through* the shield): **100% reached / 0 collisions / 56 steps** — beats the raw flagship on *every* axis; the policy learns to rely on the shield and take direct routes.
 - **Real physics (PyBullet):** the kinematic-trained policy transfers to a rigid-body sim (mass, friction, contacts) with **no retraining** — **99% / 0 collisions / 63 steps**, the safety guarantee preserved under real contacts. Writeup: [`scripts/nav/RESULTS.md`](scripts/nav/RESULTS.md).
 
-### The reconstructed scene in Isaac Sim
+### The reconstructed scene
 
-![The reconstructed mesh rendered in Isaac Sim's RTX renderer](docs/isaac_reconstructed_scene.png)
+![The reconstruction — 2.1M RGB points of the desk scene](docs/reconstruction_az90.png)
 
-*The pipeline's exported `.usdz` loaded into **Isaac Sim 5.1** on the A10G and rendered with the RTX renderer — the reconstruct → Isaac → render bridge, end to end.* Getting here meant matching Isaac's validated NVIDIA driver (the box's newer R590 driver crashes the RTX renderer — root-caused and fixed by an in-place downgrade to 580.65; see [`scripts/isaac_setup.sh`](scripts/isaac_setup.sh)). Capture script: [`scripts/isaac/render_scene.py`](scripts/isaac/render_scene.py). A GPU-parallel Isaac Lab RL port of the nav env (`src/isaac/isaac_nav_env.py`, same tested contract) is the natural next step.
+*The pipeline's reconstruction of a desk scene — **2.1M RGB points**, rendered with a small dependency-free CPU rasteriser ([`scripts/render_pointcloud.py`](scripts/render_pointcloud.py); [orbit GIF →](docs/reconstruction.gif)).*
+
+The exported scene also **loads into Isaac Sim 5.1** on the A10G and RTX-renders headlessly — the reconstruct → sim bridge, proven end to end. Getting there root-caused and fixed a real infra issue: the box's newer R590 NVIDIA driver crashes Isaac's RTX renderer, resolved by an in-place downgrade to Isaac's validated 580.65 (see [`scripts/isaac_setup.sh`](scripts/isaac_setup.sh), [`scripts/isaac/render_scene.py`](scripts/isaac/render_scene.py)). Isaac renders the exported *collision-proxy* mesh (geometry only, so untextured); a GPU-parallel Isaac Lab RL port of the nav env (`src/isaac/isaac_nav_env.py`, same tested contract) is the natural next step.
 
 ### LingBot-Map → TensorRT (optimization study)
 
