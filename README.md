@@ -122,10 +122,20 @@ python scripts/eval_odometry.py --frontend superpoint --provider tensorrt   # 3.
 
 *A PPO policy (trained from scratch, 1.5M steps) driving to the goal through randomized obstacle fields using a 16-beam lidar observation — [full MP4 →](docs/nav_ppo_policy.mp4).*
 
-The endpoint of the pipeline is a scene a robot can *act* in, so this milestone closes the loop: a differential-drive agent that learns to navigate. Built backend-agnostic — a pure-NumPy env + task core (`src/isaac/nav_sim.py`, fully unit-tested on a laptop, 22 tests) with a thin `gymnasium` shell, so a PyBullet / Isaac Lab port is an adapter, not a rewrite.
+The endpoint of the pipeline is a scene a robot can *act* in, so this milestone closes the loop: a differential-drive agent that learns to navigate. Built backend-agnostic — a pure-NumPy env + task core (`src/isaac/nav_sim.py`, fully unit-tested on a laptop) with a thin `gymnasium` shell, so a PyBullet / Isaac Lab port is an adapter, not a rewrite. The honest arc (all measured on an A10G, held-out random scenes):
 
-- **Hand-written baseline:** a lidar follow-the-gap controller — 35/40 random scenes solved, **0 collisions** (vs a blind go-to-goal's 12/40, 28 collisions).
-- **Learned policy (PPO, stable-baselines3):** **98%** reached on held-out random scenes (matches the heuristic) while reaching **~40% faster** — the classic efficiency-vs-safety trade a learned policy discovers (it trades the heuristic's perfect safety for a small 2% collision rate). Measured, A10G.
+- **Hand-written baseline:** a lidar follow-the-gap controller — safe (**0 collisions**) but slow (99 steps).
+- **Learned policy (PPO):** **98%** reached, **~40% faster** than the heuristic — but it discovers the classic speed↔safety trade, clipping obstacles at a **~2% collision** rate.
+- **Reward shaping — reported straight:** a dense clearance penalty is a *convergence-speed* lever, not a safety fix; at full budget it barely moved collisions (4→3). Softer reward can't break the frontier — and I said so rather than dressing it up.
+- **Hard safety shield** (one-step-lookahead action filter) — the frontier-breaker: collisions **4 → 0**, provably. The shielded learned policy now **Pareto-dominates the hand-written baseline** (same 0 collisions, but 79 vs 99 steps).
+- **Shield-in-the-loop** (train *through* the shield): **100% reached / 0 collisions / 56 steps** — beats the raw flagship on *every* axis; the policy learns to rely on the shield and take direct routes.
+- **Real physics (PyBullet):** the kinematic-trained policy transfers to a rigid-body sim (mass, friction, contacts) with **no retraining** — **99% / 0 collisions / 63 steps**, the safety guarantee preserved under real contacts. Writeup: [`scripts/nav/RESULTS.md`](scripts/nav/RESULTS.md).
+
+### The reconstructed scene in Isaac Sim
+
+![The reconstructed mesh rendered in Isaac Sim's RTX renderer](docs/isaac_reconstructed_scene.png)
+
+*The pipeline's exported `.usdz` loaded into **Isaac Sim 5.1** on the A10G and rendered with the RTX renderer — the reconstruct → Isaac → render bridge, end to end.* Getting here meant matching Isaac's validated NVIDIA driver (the box's newer R590 driver crashes the RTX renderer — root-caused and fixed by an in-place downgrade to 580.65; see [`scripts/isaac_setup.sh`](scripts/isaac_setup.sh)). Capture script: [`scripts/isaac/render_scene.py`](scripts/isaac/render_scene.py). A GPU-parallel Isaac Lab RL port of the nav env (`src/isaac/isaac_nav_env.py`, same tested contract) is the natural next step.
 
 ### LingBot-Map → TensorRT (optimization study)
 
@@ -140,7 +150,7 @@ See [`scripts/lingbot_trt/RESULTS.md`](scripts/lingbot_trt/RESULTS.md).
 
 ## Tech stack
 
-Python · PyTorch · TensorRT · custom CUDA · OpenUSD · OpenCV · NumPy · stable-baselines3 / Gymnasium (RL) — targeting NVIDIA Isaac Sim / Omniverse.
+Python · PyTorch · TensorRT · custom CUDA · OpenUSD · OpenCV · NumPy · stable-baselines3 / Gymnasium · PyBullet (rigid-body RL) · NVIDIA Isaac Sim 5.1 / Omniverse (RTX render of the reconstructed scene).
 
 ## License
 
