@@ -6,24 +6,24 @@
 # Launcher, no display) into its OWN venv, then Isaac Lab on top, and runs a headless
 # smoke import so the box is proven before any real work.
 #
-# ── BLOCKED on this box: DRIVER TOO NEW (root cause CONFIRMED 2026-07-18) ──────────────
-# Isaac Sim 5.1.0 pip-installs AND its NGC Docker image both run on this A10G box, Kit
-# boots and loads extensions — then the RTX scene renderer (librtx.scenedb.plugin /
-# libcarb.scenerenderer-rtx / libomni.hydra.rtx) SEGFAULTS at carbOnPluginStartup.
-#   ROOT CAUSE: this box's NVIDIA driver is **595.71.05 (the R590 branch)**, which is NOT
-#   validated for Isaac Sim 5.1.0 — a KNOWN NVIDIA incompatibility (Isaac GitHub #648/#651/
-#   #537, NVIDIA forums): the R590 driver branch crashes the Omniverse RTX renderer in
-#   exactly this plugin, across many GPUs. Isaac Sim 5.1.0's validated Linux driver is
-#   **580.65.06**. It is NOT our scene (0-ERROR by usd_isaac_check), NOT OOM (13.5 GB free),
-#   NOT missing userspace libs (the Docker image bundles them and STILL crashes — the driver
-#   comes from the HOST, so Docker can't fix a driver-level mismatch).
-#   → FIX: run on a box whose driver is ~580.x (ask Brev for a 580-era image, or a different
-#     instance), or wait for an Isaac Sim build validated against the R590/595 driver branch.
-#   → Also this g5.xlarge has 16 GB RAM (Isaac recommends 32 GB) — ok for Phase 0, size up
+# ── RESOLVED 2026-07-18: needed the driver downgraded to 580.65 (Isaac now RENDERS) ───────
+# The 595.71 (R590-branch) driver Brev ships is NOT validated for Isaac Sim 5.1.0 and SEGFAULTS
+# the RTX renderer (librtx.scenedb.plugin!carbOnPluginStartup) at startup — reproduced on BOTH
+# the pip install and the NGC Docker image (so it is NOT userspace libs; the driver is the
+# host's, Docker can't override it). Confirmed NVIDIA-known (Isaac GitHub #648/#651/#537).
+#   FIX THAT WORKED: downgrade the host driver in place to **580.65.06** (Isaac 5.1's validated
+#   version). This box's 595 was a plain .run install, so: download the 580.65.06 .run, unload
+#   the modules (stubborn holders: efa_nv_peermem/nvidia_fs/gdrdrv + `systemctl mask --now
+#   nvidia-persistenced` so it can't restart-reload mid-install; pre-extract with --extract-only
+#   to avoid the reload race during the uncompress), install, done — no reboot needed (installer
+#   loaded 580 live). After that: Kit boots, RTX renders, and scripts/isaac/render_scene.py
+#   produces PNGs of the reconstructed scene (docs/isaac_reconstructed_scene*.png).
+#   → Run Isaac via the NGC container: docker login nvcr.io ($oauthtoken + NGC key), then the
+#     `docker run` in render_scene.py's header. Use --user root + a mounted shader cache
+#     (/isaac-sim/kit/cache) — first boot compiles shaders for ~7 min.
+#   → RAM: this g5.xlarge is 16 GB (Isaac recommends 32 GB) — fine for load+render, size up
 #     before RL training with many parallel envs.
-# NOT a project blocker: the reconstruct→physics bridge is ALREADY proven via the PyBullet
-# backend (nav_pybullet, sim-to-sim 99%/0). Isaac is the eventual GPU-parallel/photoreal
-# target, gated purely on getting a driver-580 box — not on our code.
+# The reconstruct→physics bridge was ALSO already proven via PyBullet (nav_pybullet, 99%/0).
 #
 # VERIFIED requirements/steps (2026-07-18): driver 595.71 (>=580.65 ✓), Ubuntu 22.04,
 # Python 3.11 (Isaac 5.X needs 3.11 — get it via `uv python install 3.11`, no sudo), and
