@@ -97,21 +97,36 @@ def main() -> int:
         World, DynamicSphere, add_reference_to_stage = _import_isaac_core()
 
         world = World(stage_units_in_meters=1.0)
-        # gravity along -up so the collider is tested in its authored orientation
-        world.get_physics_context().set_gravity(tuple(-9.81 * c for c in up_vec))
+        # Gravity along -up so the collider is tested in its authored orientation. Isaac Sim 5.x's
+        # PhysicsContext.set_gravity takes a *scalar* (direction defaults to -Z), but the stage may
+        # be Y-up — so author the gravity DIRECTION + magnitude on the UsdPhysics.Scene prim, which
+        # is version-stable and lets us point it along -up (e.g. -Y).
+        from pxr import UsdPhysics, Gf
+        scene = next((UsdPhysics.Scene(p) for p in world.stage.Traverse()
+                      if p.IsA(UsdPhysics.Scene)), None) \
+            or UsdPhysics.Scene.Define(world.stage, "/physicsScene")
+        scene.CreateGravityDirectionAttr().Set(Gf.Vec3f(*[float(-c) for c in up_vec]))
+        scene.CreateGravityMagnitudeAttr().Set(9.81)
 
         # reference the exported scene; its collision mesh already carries CollisionAPI
         add_reference_to_stage(usd_path=os.path.abspath(args.usdz), prim_path="/World/Scene")
 
-        # find the mesh's top along the up-axis so we spawn just above it
-        from pxr import UsdGeom, Usd
+        # find the mesh's top along the up-axis so we spawn just above it, and ensure each mesh is
+        # an EXACT static triangle-mesh collider (approximation=none) so the sphere rests on the
+        # real surface instead of tunnelling — applied before world.reset() cooks PhysX.
+        from pxr import UsdGeom, Usd, UsdPhysics
         stage = world.stage
-        top = 0.0
+        top = -1e30
         for prim in stage.Traverse():
             if prim.IsA(UsdGeom.Mesh):
+                UsdPhysics.CollisionAPI.Apply(prim)
+                UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr().Set(
+                    UsdPhysics.Tokens.none)
                 bbox = UsdGeom.Imageable(prim).ComputeWorldBound(
                     Usd.TimeCode.Default(), UsdGeom.Tokens.default_).ComputeAlignedRange()
                 top = max(top, bbox.GetMax()[axis_idx])
+        if top < -1e29:
+            top = 0.0                                   # no mesh found — fall back to origin
         spawn = [0.0, 0.0, 0.0]
         spawn[axis_idx] = top + args.drop_height
 
