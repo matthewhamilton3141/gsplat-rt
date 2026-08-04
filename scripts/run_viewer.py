@@ -44,6 +44,16 @@ def main() -> int:
     ap.add_argument("--ply", default=None, help="view a static .ply instead")
     ap.add_argument("--demo", action="store_true",
                     help="serve a procedural scene (no pipeline, no GPU)")
+    ap.add_argument("--nav", action="store_true",
+                    help="digital-twin nav demo: a shielded DWA car drives a reconstructed "
+                         "occupancy scene, live in 3-D (no pipeline, no GPU)")
+    ap.add_argument("--nav-occupancy", default=None,
+                    help="drive a real reconstructed occupancy map (.npy/.png) instead of the "
+                         "default procedural driving scene; needs --nav-start/--nav-goal")
+    ap.add_argument("--nav-resolution", type=float, default=0.1,
+                    help="metres/cell for --nav-occupancy")
+    ap.add_argument("--nav-start", type=float, nargs=3, default=None, metavar=("X", "Y", "H"))
+    ap.add_argument("--nav-goal", type=float, nargs=2, default=None, metavar=("X", "Y"))
     ap.add_argument("--scene", default="sphere", choices=["sphere", "plane", "axes"],
                     help="procedural demo shape (--demo): sphere, plane, or axes")
     ap.add_argument("--host", default="127.0.0.1")
@@ -74,7 +84,15 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     manager = None
-    if args.ply:
+    nav = None
+    if args.nav:
+        from nav_runner import make_nav_runner
+        nav = make_nav_runner(occupancy=args.nav_occupancy, resolution=args.nav_resolution,
+                              start=args.nav_start, goal=args.nav_goal)
+        source = SyntheticSceneSource(shape="axes")   # unused (client shows the nav layer)
+        label = ("nav digital-twin: " +
+                 (args.nav_occupancy if args.nav_occupancy else "procedural driving scene"))
+    elif args.ply:
         source = PlySceneSource(args.ply)
         label = f"ply: {args.ply}"
     elif args.demo or args.source is None:
@@ -98,12 +116,14 @@ def main() -> int:
     # Start the web server first so the page is reachable immediately — before we
     # touch the camera (which on macOS may block on a permission prompt).
     viewer = WebViewer(source, host=args.host, port=args.port,
-                       max_points=args.max_points).start()
+                       max_points=args.max_points, nav=nav).start()
     print(f"\n  gsplat-rt viewer — {label}\n  open  {viewer.url}\n  Ctrl-C to stop\n")
 
     if manager is not None:
         print("  starting pipeline… (grant camera access if macOS prompts)\n")
         manager.start()
+    if nav is not None:
+        nav.start()
 
     try:
         t0 = time.time()
@@ -119,6 +139,8 @@ def main() -> int:
         viewer.stop()
         if manager is not None:
             manager.stop()
+        if nav is not None:
+            nav.stop()
     return 0
 
 

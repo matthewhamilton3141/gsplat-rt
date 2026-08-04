@@ -294,23 +294,132 @@ function drawOccupancy(occ) {
   occCtx.putImageData(img, 0, 0);
 }
 
+// --- nav layer: a shielded car driving the reconstructed occupancy scene ---
+// World is planar (x, y); map to the Three.js ground plane as (x, up, y). A car heading h
+// (atan2 of forward in world x/y) becomes a rotation of -h about the up axis.
+const OUTCOME_COLOR = { run: 0xc87828, reached: 0x3cb43c, collided: 0xd02828, timeout: 0xc8a028 };
+let navActive = false, navBuilt = false;
+let navCar = null, navTrail = null, navLidar = null, navGoal = null, navBoxes = null;
+const navGroup = new THREE.Group();
+scene.add(navGroup);
+
+function buildNavScene(sc) {
+  navBuilt = true;
+  clearSplat();                                   // nav mode owns the view; no splats
+  const [xmin, ymin, xmax, ymax] = sc.bounds;
+  const cx = (xmin + xmax) / 2, cy = (ymin + ymax) / 2;
+
+  // Ground plane under the whole scene.
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(xmax - xmin, ymax - ymin),
+    new THREE.MeshBasicMaterial({ color: 0x161a1f }));
+  ground.rotation.x = -Math.PI / 2;               // XY plane -> XZ ground
+  ground.position.set(cx, -0.001, cy);
+  navGroup.add(ground);
+
+  // Occupied cells as instanced boxes (curbs / obstacles of the reconstructed grid).
+  const cs = sc.cell_size, bh = 0.5;
+  const boxGeo = new THREE.BoxGeometry(cs, bh, cs);
+  const boxMat = new THREE.MeshBasicMaterial({ color: 0x5a616a });
+  navBoxes = new THREE.InstancedMesh(boxGeo, boxMat, sc.cells.length);
+  const m = new THREE.Matrix4();
+  sc.cells.forEach(([x, y], i) => { m.setPosition(x, bh / 2, y); navBoxes.setMatrixAt(i, m); });
+  navBoxes.instanceMatrix.needsUpdate = true;
+  navGroup.add(navBoxes);
+
+  // Goal marker (a ring on the ground).
+  navGoal = new THREE.Mesh(new THREE.TorusGeometry(0.4, 0.07, 8, 24),
+    new THREE.MeshBasicMaterial({ color: 0x3cb43c }));
+  navGoal.rotation.x = -Math.PI / 2;
+  navGoal.position.set(sc.goal[0], 0.06, sc.goal[1]);
+  navGroup.add(navGoal);
+
+  // Car body.
+  navCar = new THREE.Mesh(new THREE.BoxGeometry(sc.car.length, 0.28, sc.car.width),
+    new THREE.MeshBasicMaterial({ color: OUTCOME_COLOR.run }));
+  navGroup.add(navCar);
+
+  navTrail = new THREE.Line(new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ color: 0x4aa0d8 }));
+  navLidar = new THREE.LineSegments(new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ color: 0x9ccf6a, transparent: true, opacity: 0.6 }));
+  navGroup.add(navTrail, navLidar);
+
+  scene.remove(grid);                             // hide the default helper grid; nav owns the floor
+  const radius = Math.hypot(xmax - xmin, ymax - ymin) * 0.5;
+  frameTo({ min: [xmin, -0.5, ymin], max: [xmax, 1.0, ymax] }, new THREE.Vector3(cx, 0, cy));
+  camera.position.set(cx, radius * 1.3, cy + radius * 1.2);
+  camera.far = radius * 100; camera.updateProjectionMatrix(); controls.update();
+}
+
+function updateNav(st) {
+  if (!navBuilt || !st || !st.car) return;
+  const [x, y] = st.car;
+  navCar.position.set(x, 0.14, y);
+  navCar.rotation.y = -st.heading;
+  navCar.material.color.setHex(OUTCOME_COLOR[st.outcome] ?? OUTCOME_COLOR.run);
+
+  const tp = new Float32Array(st.trail.length * 3);
+  st.trail.forEach(([tx, ty], i) => { tp[i*3] = tx; tp[i*3+1] = 0.05; tp[i*3+2] = ty; });
+  navTrail.geometry.setAttribute('position', new THREE.Float32BufferAttribute(tp, 3));
+  navTrail.geometry.setDrawRange(0, st.trail.length);
+
+  const lp = new Float32Array(st.lidar.length * 6);
+  st.lidar.forEach(([ex, ey], i) => {
+    lp[i*6] = x; lp[i*6+1] = 0.1; lp[i*6+2] = y;
+    lp[i*6+3] = ex; lp[i*6+4] = 0.1; lp[i*6+5] = ey;
+  });
+  navLidar.geometry.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
+
+  const so = $('s-outcome'); if (so) { so.textContent = st.outcome; so.style.color = '#' + (OUTCOME_COLOR[st.outcome] ?? OUTCOME_COLOR.run).toString(16).padStart(6, '0'); }
+  const ss = $('s-step'); if (ss) ss.textContent = st.step;
+}
+
+async function pollNav() {
+  try {
+    const st = await (await fetch('api/nav')).json();
+    if (st && st.car) { updateNav(st); setStatus('nav live', true); }
+  } catch (e) { /* nav is optional */ }
+}
+
 // --- polling -------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 function setStatus(text, ok) { const s = $('status'); s.textContent = text; s.style.color = ok ? '#7ee3c7' : '#f0b072'; }
 
 async function poll() {
-  try {
-    const scn = await (await fetch('api/scene')).json();
-    rebuildPoints(scn);
-    updateStats(scn.stats || {}, scn.count);
-    setStatus('live', true);
-  } catch (e) {
-    setStatus('waiting for pipeline…', false);
+  if (!navActive) {
+    try {
+      const scn = await (await fetch('api/scene')).json();
+      rebuildPoints(scn);
+      updateStats(scn.stats || {}, scn.count);
+      setStatus('live', true);
+    } catch (e) {
+      setStatus('waiting for pipeline…', false);
+    }
+    try {
+      const occ = await (await fetch('api/occupancy')).json();
+      drawOccupancy(occ);
+    } catch (e) { /* occupancy is optional */ }
   }
+}
+
+// One-shot: if a nav scene is being served, switch to the nav demo and poll it fast.
+// Returns true when nav is active (so the caller skips the splat-scene polling entirely —
+// otherwise a splat poll races in first, draws stray points and hijacks the camera framing).
+async function initNav() {
   try {
-    const occ = await (await fetch('api/occupancy')).json();
-    drawOccupancy(occ);
-  } catch (e) { /* occupancy is optional */ }
+    const sc = await (await fetch('api/nav_scene')).json();
+    if (sc && sc.bounds) {
+      navActive = true;
+      buildNavScene(sc);
+      const nav = document.getElementById('navhud'); if (nav) nav.style.display = 'block';
+      const occ = document.getElementById('occ'); if (occ) occ.style.display = 'none';
+      setInterval(pollNav, 100);
+      pollNav();
+      return true;
+    }
+  } catch (e) { /* no nav runner attached */ }
+  return false;
 }
 
 function updateStats(stats, count) {
@@ -347,5 +456,8 @@ function animate() {
 }
 animate();
 
-poll();
-setInterval(poll, POLL_MS);
+// Boot: prefer the nav demo if a runner is attached; otherwise poll the splat pipeline scene.
+(async function boot() {
+  const navOn = await initNav();
+  if (!navOn) { poll(); setInterval(poll, POLL_MS); }
+})();

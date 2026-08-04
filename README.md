@@ -131,6 +131,18 @@ The endpoint of the pipeline is a scene a robot can *act* in, so this milestone 
 - **Shield-in-the-loop** (train *through* the shield): **100% reached / 0 collisions / 56 steps** — beats the raw flagship on *every* axis; the policy learns to rely on the shield and take direct routes.
 - **Real physics (PyBullet):** the kinematic-trained policy transfers to a rigid-body sim (mass, friction, contacts) with **no retraining** — **99% / 0 collisions / 63 steps**, the safety guarantee preserved under real contacts. Writeup: [`scripts/nav/RESULTS.md`](scripts/nav/RESULTS.md).
 
+### Digital-twin driving — a car navigating reconstructed geometry
+
+![A shielded car weaving an obstacle scene rebuilt as an occupancy grid](docs/car_digital_twin.gif)
+
+*A kinematic-bicycle car threading a reconstructed-style scene, behind a braking safety shield — 0 collisions ([full MP4 →](docs/car_digital_twin.mp4)), and the same loop [live in the browser](docs/nav_browser.png).*
+
+The AV-honest role of Gaussian splatting isn't onboard perception — it's the **digital twin**: reconstruct a recorded scene into geometry, then test a driving policy *inside* it, closed-loop (Street Gaussians / UniSim-style). This milestone builds exactly that path on the nav stack, all pure-NumPy/CPU (no box):
+
+- **Occupancy-grid world** (`src/isaac/grid_world.py`): the nav env's collision / lidar / clearance generalized from hand-placed circles to an arbitrary metric **occupancy grid**, so the same policy + shield run over *reconstructed shape*. A `.npy`/`.png` map (the pipeline's occupancy, a KITTI BEV) drops straight in.
+- **A car, not a puck** (`src/isaac/car_sim.py`): a kinematic-**bicycle** model (steering + wheelbase; can't pivot in place) with a **braking** safety shield — the non-holonomic analogue of the diff-drive shield. Driven by a **Dynamic-Window-Approach** local planner (rolls out dynamically-feasible arcs, rejects any that lose clearance) — a reactive gap-follower provably wedges a car at the shield's keep-out shell; DWA doesn't.
+- **Live in the browser** (`scripts/run_viewer.py --nav`): the existing Three.js viewer renders the occupancy grid in 3-D and animates the shielded car driving it, polled off a background runner — the reconstruct → test-a-policy-inside-it loop, watchable.
+
 ### The reconstructed scene
 
 ![The reconstruction — 2.1M RGB points of the desk scene](docs/reconstruction_az90.png)
