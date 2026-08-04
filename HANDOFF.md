@@ -1,7 +1,30 @@
-# gsplat-rt — session handoff (updated 2026-08-01)
+# gsplat-rt — session handoff (updated 2026-08-04)
 
 Human-readable "pick up here." Persistent context also lives in Claude memory (`MEMORY.md`
 auto-loads each session); this is the plain-English summary of where things stand.
+
+## 2026-08-04 — Option A (digital-twin nav) BUILT + merged to main, read this first
+Built the "something cool" in-repo capstone, reframed on your pushback (*"not a webcam scan —
+how would I teach an AV in a room?"*): the AV-honest use of splats is a **digital twin** —
+reconstruct a scene into an occupancy grid, then test a driving policy *inside* it, closed-loop.
+Three milestones, all pure-NumPy/OpenCV + Three.js, **Mac-only (no box)**, all **merged to main**:
+- **Occupancy-grid world** (`src/isaac/grid_world.py`, #36): `GridWorld` gives the nav env
+  clearance/collision/lidar against an arbitrary metric occupancy grid, folded into `nav_sim`
+  additively (`cfg.grid_world`). Same policy + shield now run over reconstructed *shape*.
+- **Ackermann car + braking shield + DWA planner** (`src/isaac/car_sim.py`, `driving_scene.py`,
+  `scripts/nav/drive_scene.py`, #38): `BicycleNavEnv` (can't pivot at v=0) + `car_safety_shield`
+  (brakes) + `car_dwa_action` (a Dynamic-Window-Approach local planner — a reactive gap-follower
+  provably wedges a non-holonomic car at the shield's keep-out shell; DWA rolls out feasible arcs
+  and doesn't). Demo: `docs/car_digital_twin.{mp4,gif,png}` (0 collisions, 196 steps).
+- **In-browser closed loop** (`src/viz/nav_runner.py`, `web_viewer.py` `/api/nav[_scene]`,
+  `static/viewer.js` nav layer, `run_viewer.py --nav`, #38): the Three.js viewer renders the
+  occupancy grid in 3-D and animates the shielded car driving it live. Verified headless-Chromium
+  (0 JS errors) → `docs/nav_browser.png`. Run: `python scripts/run_viewer.py --nav`.
+
+Suite now **266 passed, 6 skipped** (was 229; +52 tests). **Real-map path is wired but only
+tested on synthetic + a `.npy` round-trip** — feeding it an actual KITTI BEV / the pipeline's
+`*_occupancy` via `driving_scene.load_occupancy_grid` is the natural next step. Full detail in
+memory `gsplat-digital-twin-nav.md`. Everything below (2026-08-01 pivot) still governs.
 
 ## 2026-08-01 — strategic pivot, read this first
 **"I don't want to make this a portfolio piece, I just want to make something cool."** This
