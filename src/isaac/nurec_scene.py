@@ -187,3 +187,126 @@ def nurec_to_gridworld(path: str, *, resolution: float = 0.2, up_axis: int = 2,
     grid = mesh_to_occupancy(verts, faces, resolution=resolution, up_axis=up_axis, band=band, **kw)
     start, goal = pick_start_goal(grid)
     return grid, start, goal
+
+
+# ============================================================================================
+# NuRec ground-truth (clipgt) path: build a scene from the annotated road boundaries + tracked
+# obstacles + ego trajectory — richer and cleaner than the raw surface mesh. A real NuRec clip's
+# `.usdz` is a container zip; unpack it and point at the `clipgt/` directory of `.parquet` files.
+# ============================================================================================
+
+def quat_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
+    """Heading (yaw about +z, rad) of a quaternion — the planar orientation the car env uses."""
+    return float(np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)))
+
+
+def gt_to_occupancy(boundaries, obstacle_boxes, bounds, resolution: float = 0.3,
+                    boundary_thickness: int = 2, dilate_cells: int = 1) -> GridWorld:
+    """Rasterise NuRec GT into a `GridWorld`: boundary polylines → walls, obstacle boxes → filled.
+
+    `boundaries` is a list of `(N, 2)` world polylines (road edges / barriers / curbs); each is
+    drawn as an occupied line `boundary_thickness` px wide. `obstacle_boxes` is a list of
+    `(cx, cy, sx, sy, yaw)` oriented rectangles (tracked vehicles/people); each is filled. A
+    `dilate_cells` pass closes one-cell gaps. `bounds` is `(x_min, y_min, x_max, y_max)`.
+    """
+    x_min, y_min, x_max, y_max = bounds
+    w = max(1, int(np.ceil((x_max - x_min) / resolution)))
+    h = max(1, int(np.ceil((y_max - y_min) / resolution)))
+    occ = np.zeros((h, w), np.uint8)
+
+    def to_px(pts):
+        pts = np.asarray(pts, float).reshape(-1, 2)
+        return np.stack([(pts[:, 0] - x_min) / resolution,
+                         (pts[:, 1] - y_min) / resolution], axis=-1).astype(np.int32)
+
+    for poly in boundaries:
+        p = to_px(poly)
+        if len(p) >= 2:
+            cv2.polylines(occ, [p], False, 1, boundary_thickness)
+    for cx, cy, sx, sy, yaw in obstacle_boxes:
+        hx, hy = sx / 2.0, sy / 2.0
+        c, s = np.cos(yaw), np.sin(yaw)
+        corners = [(cx + dx * c - dy * s, cy + dx * s + dy * c)
+                   for dx, dy in ((-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy))]
+        cv2.fillPoly(occ, [to_px(corners)], 1)
+    if dilate_cells > 0:
+        k = 2 * dilate_cells + 1
+        occ = cv2.dilate(occ, np.ones((k, k), np.uint8))
+    return GridWorld(occ, origin=(x_min, y_min), resolution=resolution)
+
+
+def path_arclength(path: np.ndarray) -> np.ndarray:
+    """Cumulative arc length (m) along an `(N, 2)` polyline — `[0, ..., total]`, length N."""
+    seg = np.diff(np.asarray(path, float), axis=0)
+    return np.concatenate([[0.0], np.cumsum(np.hypot(seg[:, 0], seg[:, 1]))])
+
+
+def pursuit_target(path: np.ndarray, arc: np.ndarray, pos: np.ndarray,
+                   lookahead: float) -> np.ndarray:
+    """Pure-pursuit goal: the path point ~`lookahead` m ahead (by arc length) of the nearest one.
+
+    A local planner (DWA) can't follow a long curved route from a single far goal — it cuts the
+    corner and wedges. Feeding a moving look-ahead point along the recorded ego path turns it into
+    path-following, so the car tracks the actual driven route. Pure geometry (testable).
+    """
+    path = np.asarray(path, float)
+    i = int(np.argmin(np.hypot(path[:, 0] - pos[0], path[:, 1] - pos[1])))
+    j = min(int(np.searchsorted(arc, arc[i] + lookahead)), len(path) - 1)
+    return path[j].copy()
+
+
+def load_nurec_gt(clipgt_dir: str, drop_on_path_m: float = 2.8) -> dict:
+    """Read a NuRec clip's `clipgt/` GT into `{path, yaw0, boundaries, obstacle_boxes}`.
+
+    Parses `egomotion_estimate` (the ego trajectory → start/goal + heading), `road_boundary`
+    (drivable-area edges → walls) and `obstacle` (tracked boxes; one per `trackline_id`). Obstacles
+    whose centre is within `drop_on_path_m` of the ego path are dropped: with a static snapshot they
+    are in-lane traffic the ego passed by *timing*, which would falsely block the route (roadside
+    parked cars stay). Needs `pyarrow` (lazy-imported); a real NuRec `.usdz` unpacks to this dir.
+    """
+    import os as _os
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as e:                              # pragma: no cover - env-dependent
+        raise ImportError("reading NuRec GT needs pyarrow (`pip install pyarrow`)") from e
+
+    def col(name, key):
+        return pq.read_table(_os.path.join(clipgt_dir, name)).column(key).to_pylist()
+
+    ego = col("egomotion_estimate.parquet", "egomotion_estimate")
+    path = np.array([[e["location"]["x"], e["location"]["y"]] for e in ego], float)
+    q0 = ego[0]["orientation"]
+    yaw0 = quat_yaw(q0["x"], q0["y"], q0["z"], q0["w"])
+
+    boundaries = [np.array([[p["x"], p["y"]] for p in b["location"]], float)
+                  for b in col("road_boundary.parquet", "road_boundary") if b.get("location")]
+
+    tracks = {}
+    for o in col("obstacle.parquet", "obstacle"):
+        tracks.setdefault(o["trackline_id"], o)
+    boxes = []
+    for o in tracks.values():
+        c, s, q = o["center"], o["size"], o["orientation"]
+        if len(path) and np.min(np.hypot(path[:, 0] - c["x"], path[:, 1] - c["y"])) < drop_on_path_m:
+            continue
+        boxes.append((c["x"], c["y"], s["x"], s["y"],
+                      quat_yaw(q["x"], q["y"], q["z"], q["w"])))
+    return {"path": path, "yaw0": yaw0, "boundaries": boundaries, "obstacle_boxes": boxes}
+
+
+def nurec_gt_to_scene(clipgt_dir: str, *, resolution: float = 0.3, margin: float = 15.0,
+                      drop_on_path_m: float = 2.8, **occ_kw):
+    """NuRec `clipgt/` → `(grid, start, goal, ego_path)` ready to drive with pure-pursuit.
+
+    `start`/`goal`/heading come from the recorded ego trajectory; the returned `ego_path` is the
+    route to follow via `pursuit_target`. `grid` bounds are the ego path's extent + `margin`.
+    """
+    gt = load_nurec_gt(clipgt_dir, drop_on_path_m=drop_on_path_m)
+    p = gt["path"]
+    bounds = (float(p[:, 0].min()) - margin, float(p[:, 1].min()) - margin,
+              float(p[:, 0].max()) + margin, float(p[:, 1].max()) + margin)
+    grid = gt_to_occupancy(gt["boundaries"], gt["obstacle_boxes"], bounds,
+                           resolution=resolution, **occ_kw)
+    start = (float(p[0, 0]), float(p[0, 1]), gt["yaw0"])
+    goal = (float(p[-1, 0]), float(p[-1, 1]))
+    return grid, start, goal, p
