@@ -34,6 +34,7 @@ from typing import Optional
 
 import numpy as np
 
+from .grid_world import GridWorld
 from .nav_task import (
     ACT_DIM,
     OBS_DIM,
@@ -73,6 +74,11 @@ class NavSimConfig:
     bounds: tuple[float, float, float, float] = (-5.0, -5.0, 5.0, 5.0)
     # Obstacles as an (N, 3) array of circles; default is empty (open field).
     obstacles: Optional[np.ndarray] = None
+    # Optional reconstructed geometry: a metric occupancy grid the robot also collides against
+    # and senses (see grid_world.GridWorld). Combined *additively* with the circle obstacles and
+    # the rectangular bounds — clearance = min, collision = or, lidar = min ray distance — so the
+    # same policy + safety shield run unchanged over a reconstructed scene. None disables it.
+    grid_world: Optional[GridWorld] = None
 
     # --- start / goal sampling ---
     # If set, used verbatim each reset; else sampled uniformly in bounds (collision-free).
@@ -136,6 +142,19 @@ def clearance_at(xy: np.ndarray, obstacles: np.ndarray,
     return float(clear)
 
 
+def world_clearance(xy: np.ndarray, obstacles: np.ndarray, cfg: "NavSimConfig") -> float:
+    """Signed clearance (m) to the nearest of *any* world geometry: circles, walls, and grid.
+
+    The single combiner shared by the env's `_clearance` and the `safety_shield` so both see the
+    identical world. `min` of the circle+bounds clearance and (if present) the reconstructed
+    grid's clearance — additive, so a scene may carry both.
+    """
+    c = clearance_at(xy, obstacles, cfg.bounds, cfg.robot_radius)
+    if cfg.grid_world is not None:
+        c = min(c, cfg.grid_world.clearance(xy, cfg.robot_radius))
+    return c
+
+
 def safety_shield(action: np.ndarray, robot_xy: np.ndarray, heading: float,
                   obstacles: np.ndarray, cfg: "NavSimConfig") -> np.ndarray:
     """Hard one-step-lookahead safety filter over a commanded (lin, ang) action.
@@ -155,7 +174,7 @@ def safety_shield(action: np.ndarray, robot_xy: np.ndarray, heading: float,
         else np.zeros((0, 3), float)
     for s in np.linspace(1.0, 0.0, 11):          # largest safe forward fraction wins
         nxt = predict_pose(robot_xy, heading, s * lin, ang, cfg.dt)
-        if clearance_at(nxt, obs, cfg.bounds, cfg.robot_radius) >= cfg.safety_margin:
+        if world_clearance(nxt, obs, cfg) >= cfg.safety_margin:
             return np.array([s * lin, ang], np.float32)
     return np.array([0.0, ang], np.float32)       # boxed in: rotate in place, never advance
 
@@ -236,6 +255,8 @@ class DiffDriveNavEnv:
             d = np.linalg.norm(self._obstacles[:, :2] - xy[None, :], axis=1)
             if np.any(d <= self._obstacles[:, 2] + r):
                 return True
+        if self.cfg.grid_world is not None and self.cfg.grid_world.collides(xy, r):
+            return True
         return False
 
     def _clearance(self, xy: np.ndarray) -> float:
@@ -243,9 +264,10 @@ class DiffDriveNavEnv:
 
         Positive is free space ahead of contact, 0 at touch (negative only under overlap,
         which `_collides` already flags). Feeds the optional dense proximity-penalty reward
-        shaping; delegates to the shared `clearance_at` geometry (bounds + circular obstacles).
+        shaping; delegates to the shared `world_clearance` geometry (bounds + circular obstacles
+        + any reconstructed grid), so it matches exactly what the safety shield sees.
         """
-        return clearance_at(xy, self._obstacles, self.cfg.bounds, self.cfg.robot_radius)
+        return world_clearance(xy, self._obstacles, self.cfg)
 
     def _lidar(self) -> np.ndarray:
         """Normalised free-distance readings for the beam fan (empty if disabled)."""
@@ -263,6 +285,9 @@ class DiffDriveNavEnv:
             direction = np.array([np.cos(a), np.sin(a)], float)
             dist = _ray_min_distance(origin, direction, self._obstacles,
                                      self.cfg.bounds, self.cfg.lidar_range)
+            if self.cfg.grid_world is not None:
+                dist = min(dist, self.cfg.grid_world.raycast(origin, direction,
+                                                             self.cfg.lidar_range))
             out[i] = dist / self.cfg.lidar_range
         return out
 
@@ -287,6 +312,8 @@ class DiffDriveNavEnv:
         occ = (wx < x_min) | (wx > x_max) | (wy < y_min) | (wy > y_max)
         for cx, cy, r in self._obstacles:
             occ |= (wx - cx) ** 2 + (wy - cy) ** 2 <= r * r
+        if self.cfg.grid_world is not None:
+            occ |= self.cfg.grid_world.occupied_mask(wx, wy)
         return occ.astype(np.float32).reshape(-1)
 
     def _make_obs(self) -> np.ndarray:
