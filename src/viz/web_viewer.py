@@ -87,6 +87,14 @@ def _stats_json(source) -> dict:
     return dict(source.snapshot().stats)
 
 
+def _nav_scene_json(nav) -> dict:
+    return nav.scene_json() if nav is not None else {}
+
+
+def _nav_state_json(nav) -> dict:
+    return nav.snapshot() if nav is not None else {}
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "gsplatViewer/1.0"
 
@@ -105,6 +113,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(_occupancy_json(self.server.source))
             if path == "/api/stats":
                 return self._send_json(_stats_json(self.server.source))
+            if path == "/api/nav_scene":
+                return self._send_json(_nav_scene_json(getattr(self.server, "nav", None)))
+            if path == "/api/nav":
+                return self._send_json(_nav_state_json(getattr(self.server, "nav", None)))
             self.send_error(404, "Not found")
         except BrokenPipeError:
             pass                                    # client navigated away mid-send
@@ -148,11 +160,12 @@ class WebViewer:
     """
 
     def __init__(self, source, host: str = "127.0.0.1", port: int = 8000,
-                 max_points: int = 20000):
+                 max_points: int = 20000, nav=None):
         self.source = source
         self.host = host
         self._requested_port = port
         self.max_points = max_points
+        self.nav = nav                          # optional NavRunner; served at /api/nav[_scene]
         self._httpd = None
         self._thread = None
 
@@ -181,6 +194,7 @@ class WebViewer:
             httpd = ThreadingHTTPServer((self.host, self._requested_port), _Handler)
         httpd.source = self.source              # handler reads these off the server
         httpd.max_points = self.max_points
+        httpd.nav = self.nav
         httpd.daemon_threads = True
         self._httpd = httpd
         self._thread = threading.Thread(target=httpd.serve_forever,
