@@ -104,6 +104,10 @@ def _frame(bg, env, traj, cfg, ppm, pad, h, to_px, cv2, outcome=None):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--occupancy", default=None, help="real occupancy map (.npy/.png); else synthetic")
+    ap.add_argument("--mesh", default=None,
+                    help="reconstructed surface mesh / NuRec scene (.obj/.ply/.usd/.usdz): "
+                         "projected top-down to occupancy and driven (start/goal auto unless given)")
+    ap.add_argument("--mesh-up-axis", type=int, default=2, help="mesh vertical axis (2=Z-up)")
     ap.add_argument("--resolution", type=float, default=0.1, help="metres/cell for --occupancy")
     ap.add_argument("--start", type=float, nargs=3, default=None, metavar=("X", "Y", "H"))
     ap.add_argument("--goal", type=float, nargs=2, default=None, metavar=("X", "Y"))
@@ -119,7 +123,15 @@ def main() -> int:
 
     import cv2
 
-    if args.occupancy:
+    if args.mesh:
+        from isaac.nurec_scene import nurec_to_gridworld
+        grid, start, goal = nurec_to_gridworld(args.mesh, resolution=args.resolution,
+                                               up_axis=args.mesh_up_axis)
+        if args.start is not None:
+            start = tuple(args.start)
+        if args.goal is not None:
+            goal = tuple(args.goal)
+    elif args.occupancy:
         grid = load_occupancy_grid(args.occupancy, args.resolution)
         if args.start is None or args.goal is None:
             raise SystemExit("--occupancy requires --start X Y H and --goal X Y")
