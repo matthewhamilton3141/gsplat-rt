@@ -20,11 +20,41 @@ Three milestones, all pure-NumPy/OpenCV + Three.js, **Mac-only (no box)**, all *
   `static/viewer.js` nav layer, `run_viewer.py --nav`, #38): the Three.js viewer renders the
   occupancy grid in 3-D and animates the shielded car driving it live. Verified headless-Chromium
   (0 JS errors) → `docs/nav_browser.png`. Run: `python scripts/run_viewer.py --nav`.
+- **Real reconstructed-scene loader** (`src/isaac/nurec_scene.py`, #40; README #41): a surface
+  **mesh → occupancy** projector so a real drive reconstructed by NVIDIA **NuRec** (real-to-sim
+  3DGS, shipped as USDZ + surface mesh + `.xodr`) becomes a scene the shielded car drives. Marks
+  a cell occupied only where geometry sits in the car-height band (road below / gantry above are
+  ignored). `.obj/.ply` via trimesh, `.usd/.usdz` via OpenUSD (`pxr`) — both lazy-imported (both
+  already on the Mac). Verified on synthetic meshes + an authored OpenUSD `.usda` round-trip. Run:
+  `python scripts/nav/drive_scene.py --mesh scene.usdz`.
 
-Suite now **266 passed, 6 skipped** (was 229; +52 tests). **Real-map path is wired but only
-tested on synthetic + a `.npy` round-trip** — feeding it an actual KITTI BEV / the pipeline's
-`*_occupancy` via `driving_scene.load_occupancy_grid` is the natural next step. Full detail in
-memory `gsplat-digital-twin-nav.md`. Everything below (2026-08-01 pivot) still governs.
+Suite now **276 passed, 6 skipped** (was 229; +62 tests). Full detail in memory
+`gsplat-digital-twin-nav.md`. Everything below (2026-08-01 pivot) still governs.
+
+### NEXT STEP on gsplat-rt — drive a REAL NuRec clip (Mac-only, no box)
+Everything is laid out; the only missing piece is one download (an interactive HF step, so it's a
+**you-step**), then it's one command. Decided AGAINST NVIDIA's Alpamayo-R1 *model* (11B end-to-end
+camera→trajectory planner — wrong shape for our interpretable shield+planner, and box-only);
+adopted the NuRec *dataset* instead.
+1. Accept terms: <https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles-NuRec>
+2. `hf auth login` (token: <https://hf.co/settings/tokens>) — CLI is installed (`hf` 1.26).
+3. `scripts/fetch_nurec.sh --list` → pick a clip dir → `scripts/fetch_nurec.sh '<clip_dir>/**'`
+   (downloads ~2 GB to `~/nurec`, then prints the exact `drive_scene.py --mesh …` command).
+4. If the car drives through walls, the mesh is Y-up → add `--mesh-up-axis 1`.
+Box-only, deferred: rendering the actual 3DGS splat layers, and loading the USDZ into Isaac.
+
+### Portfolio framing (agreed 2026-08-04) — pairs with `~/Documents/kitti-nav`
+One thesis across both repos: **a hard safety shield wrapped around a learned planner**, shown from
+both ends of the AV stack. kitti-nav = the onboard path (stereo VO + lidar BEV → shielded PPO
+planner on real KITTI, 78%/0 collisions); gsplat-rt = the digital-twin path (reconstruct a scene →
+drive that same shielded car *inside* it, in-browser; NuRec-ready). Rules for any blurb: NuRec is
+"ready to ingest / loader verified, real clip next" (capability, not done); Alpamayo only as a
+scoped-out *decision*, never a feature; every figure **measured, not assumed**. gsplat-rt reads as
+the *cool/ambitious* piece, kitti-nav as the *rigorous/applied* one — the contrast is the point.
+
+**→ SWITCHING TO kitti-nav:** AV/portfolio work continues in `~/Documents/kitti-nav` (its own
+`HANDOFF.md`). gsplat-rt is at a clean stopping point — `main` green, 0 open PRs; the only open
+gsplat-rt thread is the NuRec download above, do-able anytime.
 
 ## 2026-08-01 — strategic pivot, read this first
 **"I don't want to make this a portfolio piece, I just want to make something cool."** This
