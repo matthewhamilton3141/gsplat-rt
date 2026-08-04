@@ -137,12 +137,18 @@ The endpoint of the pipeline is a scene a robot can *act* in, so this milestone 
 
 *A kinematic-bicycle car threading a reconstructed-style scene, behind a braking safety shield — 0 collisions ([full MP4 →](docs/car_digital_twin.mp4)), and the same loop [live in the browser](docs/nav_browser.png).*
 
+**…and the same stack driving a *real* reconstructed drive:**
+
+![Shielded car driving a real NVIDIA NuRec reconstructed 312 m route](docs/nurec_drive.gif)
+
+*The shielded DWA car driving the full **312 m** of an NVIDIA **NuRec** clip — the clip's ground-truth road boundaries + real tracked vehicles, following the recorded ego trajectory (10 m pure-pursuit) through the interchange to its goal, 0 collisions ([full MP4 →](docs/nurec_drive.mp4)). CPU-only, no box.*
+
 The AV-honest role of Gaussian splatting isn't onboard perception — it's the **digital twin**: reconstruct a recorded scene into geometry, then test a driving policy *inside* it, closed-loop (Street Gaussians / UniSim-style). This milestone builds exactly that path on the nav stack, all pure-NumPy/CPU (no box):
 
 - **Occupancy-grid world** (`src/isaac/grid_world.py`): the nav env's collision / lidar / clearance generalized from hand-placed circles to an arbitrary metric **occupancy grid**, so the same policy + shield run over *reconstructed shape*. A `.npy`/`.png` map (the pipeline's occupancy, a KITTI BEV) drops straight in.
 - **A car, not a puck** (`src/isaac/car_sim.py`): a kinematic-**bicycle** model (steering + wheelbase; can't pivot in place) with a **braking** safety shield — the non-holonomic analogue of the diff-drive shield. Driven by a **Dynamic-Window-Approach** local planner (rolls out dynamically-feasible arcs, rejects any that lose clearance) — a reactive gap-follower provably wedges a car at the shield's keep-out shell; DWA doesn't.
 - **Live in the browser** (`scripts/run_viewer.py --nav`): the existing Three.js viewer renders the occupancy grid in 3-D and animates the shielded car driving it, polled off a background runner — the reconstruct → test-a-policy-inside-it loop, watchable.
-- **Real reconstructed scenes** (`src/isaac/nurec_scene.py`): a surface mesh → occupancy loader, so a *recorded drive* reconstructed by NVIDIA **NuRec** (real-to-sim 3DGS, shipped as USDZ + a surface mesh) becomes a scene the shielded car drives. It projects the mesh top-down into a `GridWorld` — a cell is occupied only where geometry sits in the car-height band (the road below and gantries above are correctly ignored). `.obj/.ply` load via trimesh, `.usd/.usdz` via OpenUSD; then `scripts/nav/drive_scene.py --mesh scene.usdz`. The occupancy → nav path is all CPU (no box); rendering the splats or loading the USD into Isaac stays an optional GPU step. Verified end-to-end on synthetic meshes + an authored OpenUSD round-trip; a real NuRec clip is a download away.
+- **Real reconstructed scenes** (`src/isaac/nurec_scene.py`, `scripts/nav/nurec_drive.py`): driven end-to-end on a real NVIDIA **NuRec** clip. A clip's `.usdz` unpacks to a surface mesh, 3DGS splats, an `.xodr` map, and `clipgt/` ground truth; the loader builds occupancy two ways — project the **surface mesh** top-down (occupied only in the car-height band, so the road below and gantries above are ignored; `.obj/.ply` via trimesh, `.usd/.usdz` via OpenUSD), or rasterize the **GT road boundaries + tracked-obstacle boxes** and follow the recorded **ego trajectory** with pure-pursuit. Fetch a clip with `scripts/fetch_nurec.sh`, then `scripts/nav/nurec_drive.py --clipgt <dir>`. All CPU (no box); rendering the splats or loading the USD into Isaac stays an optional GPU step.
 
 ### The reconstructed scene
 
