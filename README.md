@@ -150,6 +150,12 @@ The AV-honest role of Gaussian splatting isn't onboard perception — it's the *
 - **Live in the browser** (`scripts/run_viewer.py --nav`): the existing Three.js viewer renders the occupancy grid in 3-D and animates the shielded car driving it, polled off a background runner — the reconstruct → test-a-policy-inside-it loop, watchable.
 - **Real reconstructed scenes** (`src/isaac/nurec_scene.py`, `scripts/nav/nurec_drive.py`): driven end-to-end on a real NVIDIA **NuRec** clip. A clip's `.usdz` unpacks to a surface mesh, 3DGS splats, an `.xodr` map, and `clipgt/` ground truth; the loader builds occupancy two ways — project the **surface mesh** top-down (occupied only in the car-height band, so the road below and gantries above are ignored; `.obj/.ply` via trimesh, `.usd/.usdz` via OpenUSD), or rasterize the **GT road boundaries + tracked-obstacle boxes** and follow the recorded **ego trajectory** with pure-pursuit. Fetch a clip with `scripts/fetch_nurec.sh`, then `scripts/nav/nurec_drive.py --clipgt <dir>`. All CPU (no box); rendering the splats or loading the USD into Isaac stays an optional GPU step.
 
+### kitti-nav — a spin-off repo, real KITTI drives instead of reconstructed scenes
+
+The digital-twin nav stack above spun off into its own repo, **[kitti-nav](https://github.com/matthewhamilton3141/kitti-nav)**: same kinematic-bicycle vehicle + hard safety shield, but driving occupancy/BEV grids built from **real recorded KITTI drives** (stereo VO, lidar fusion, free-space carving, moving-object tracklets) instead of splat-reconstructed geometry — the live-perception half of the AV story that this repo's offline digital-twin path deliberately leaves out. Also pure NumPy/CPU, no GPU required; a CARLA + NVIDIA NuRec bridge closes the loop back to splatting for closed-loop testing.
+
+kitti-nav's shield has in turn spun off its own repo, **[shield-in-alpasim](https://github.com/matthewhamilton3141/shield-in-alpasim)**: wraps the shield as a driver plugin for [NVIDIA AlpaSim](https://github.com/NVlabs/alpasim), the open-source closed-loop AV validation harness released alongside NVIDIA's Alpamayo reasoning model — testing whether the shield holds up in a harder, photorealistic environment it was never tuned on. Currently a scaffold; the README there documents the real gap still open (AlpaSim's driver interface is vision-only, the shield expects per-step accel/steer + an obstacle field).
+
 ### The reconstructed scene
 
 ![The reconstruction — 2.1M RGB points of the desk scene](docs/reconstruction_az90.png)
