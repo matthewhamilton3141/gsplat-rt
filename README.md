@@ -12,6 +12,12 @@ gsplat-rt turns a live RGB stream into a 3D scene a robot can both *see* and *to
 
 *Orbiting turntable of the same reconstruction (`scripts/render_turntable.py` — a GPU-free numpy point-splat renderer). [Full-quality MP4 →](docs/reconstruction_turntable.mp4)*
 
+![A real KITTI drive reconstructed from its camera stream](docs/kitti_drive.png)
+
+![Chase-camera flythrough of the reconstructed KITTI drive](docs/kitti_drive.gif)
+
+*The same preview at street scale: a real recorded drive (KITTI raw `2011_09_26_drive_0009`, 333 m) reconstructed from its colour cameras alone — SGBM stereo depth (no lidar), sky + depth-edge filtering, placed by the OXTS ground-truth poses — then flown through by a chase camera that cranes up to reveal the whole route. All CPU (`scripts/reconstruct_kitti.py` → `scripts/render_drive.py`). Depth here is stereo, not the TensorRT mono engine above. [Full-quality MP4 →](docs/kitti_drive.mp4)*
+
 ## Headline results *(measured, NVIDIA A10G)*
 
 | Metric | Result |
@@ -181,4 +187,4 @@ Python · PyTorch · TensorRT · custom CUDA · OpenUSD · OpenCV · NumPy · st
 
 ## License
 
-MIT
+MIT. The KITTI drive preview uses [KITTI raw data](https://www.cvlibs.net/datasets/kitti/raw_data.php) (Geiger et al., IJRR 2013; CC BY-NC-SA 3.0, non-commercial; not redistributed — `data/` is gitignored) loaded via [pykitti](https://github.com/utiasSTARS/pykitti) (MIT).
