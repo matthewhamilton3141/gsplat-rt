@@ -171,3 +171,59 @@ def test_real_drive_fuses_coherent_street():
     route = drive.gt_poses[:30, :3, 3]
     d = np.min(np.linalg.norm(pts[:, None, :] - route[None, ::5], axis=-1), axis=1)
     assert np.percentile(d, 99) < 30.0                   # within the 25 m stereo cap
+
+
+@_skip
+def test_triangulated_anchor_agrees_with_stereo_on_real_frames():
+    import cv2
+    from slam.kitti_raw import KittiRawDrive
+    from reconstruct_kitti import triangulated_anchor
+
+    drive = KittiRawDrive("2011_09_26", "0009")
+    K, P = drive.intrinsics, drive.gt_poses
+    for i in (30, 300):
+        left, right = drive.rgb_pair(i)
+        gl, gr = (cv2.cvtColor(x, cv2.COLOR_RGB2GRAY) for x in (left, right))
+        gb = cv2.cvtColor(drive.rgb_pair(i + 3)[0], cv2.COLOR_RGB2GRAY)
+        uv, z = triangulated_anchor(gl, gb, K, P[i], P[i + 3])
+        assert len(z) > 100
+        s = stereo_depth(gl, gr, K.fx, drive.baseline, max_depth=40.0)
+        s = s[np.rint(uv[:, 1]).astype(int), np.rint(uv[:, 0]).astype(int)]
+        m = s > 0
+        # Two independent metric sources (GT-pose triangulation vs stereo baseline).
+        assert np.median(np.abs(z[m] - s[m]) / s[m]) < 0.08
+
+
+@_skip
+def test_mono_source_recovers_metric_depth_from_affine_relative_map():
+    """A stand-in "mono model" whose output is an unknown affine of inverse depth
+    (what Depth Anything emits) must come back metric after alignment."""
+    import cv2
+    from slam.kitti_raw import KittiRawDrive
+    from reconstruct_kitti import MonoDepthSource
+
+    drive = KittiRawDrive("2011_09_26", "0009")
+    K = drive.intrinsics
+
+    def gt_like(i):
+        gl, gr = (cv2.cvtColor(x, cv2.COLOR_RGB2GRAY) for x in drive.rgb_pair(i))
+        return stereo_depth(gl, gr, K.fx, drive.baseline, max_depth=40.0)
+
+    def fake_infer(bgr):
+        z = gt_like(fake_infer.i)
+        disp = np.where(z > 0, 1.0 / np.maximum(z, 1e-3), 0).astype(np.float32)
+        holes = (z == 0).astype(np.uint8)
+        disp = cv2.inpaint(disp, holes, 3, cv2.INPAINT_NS)   # dense, like a real model
+        return cv2.resize(7.3 * disp + 0.02, (518, 518))    # unknown scale + shift
+
+    src = MonoDepthSource(drive, fake_infer, max_depth=25.0)
+    errs = []
+    for i in range(0, 60, 6):
+        fake_infer.i = i
+        left, right = drive.rgb_pair(i)
+        d = src(i, left, right)
+        z = gt_like(i)
+        m = (d > 0) & (z > 0) & (z < 25.0)
+        errs.append(np.median(np.abs(d[m] - z[m]) / z[m]))
+    assert src.aligner.n_fits == len(errs)
+    assert np.median(errs) < 0.10
